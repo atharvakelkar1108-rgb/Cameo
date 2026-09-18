@@ -1,0 +1,13 @@
+{
+  "model": "baseline_smolvlm256m_fp32",
+  "size_mb": 978.599,
+  "total_params": 256484928,
+  "trainable_params": 256484928,
+  "model_footprint_mb": 1276.973,
+  "mean_latency_ms": 20113.31,
+  "p95_latency_ms": 32326.365,
+  "peak_memory_mb": 0.0,
+  "bleu4": 0.0488,
+  "n_eval_samples": 200,
+  "device": "cpu"
+}

@@ -1,0 +1,11 @@
+{
+  "model": "optimized_pruned30pct_int8_smolvlm256m",
+  "size_mb": 330.613,
+  "model_footprint_mb": 1558.125,
+  "mean_latency_ms": 13650.383,
+  "p95_latency_ms": 20695.967,
+  "peak_memory_mb": 0.781,
+  "bleu4": 0.0123,
+  "n_eval_samples": 200,
+  "device": "cpu"
+}

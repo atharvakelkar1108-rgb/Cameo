@@ -1,0 +1,48 @@
+# Python environments and caches
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Datasets, downloaded images, and local uploads
+/data/
+webapp/uploads/
+*.jpg
+*.jpeg
+*.png
+*.webp
+
+# Downloaded/generated model artifacts
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.onnx
+*.onnx_data
+
+# Generated evaluation output and plots
+/results/comparison_plot.png
+
+# Notebook and OS/editor metadata
+.ipynb_checkpoints/
+.DS_Store
+Thumbs.db
+.vscode/
+
+# Python packaging/build output
+build/
+dist/
+*.egg-info/
+
+# Logs
+*.log

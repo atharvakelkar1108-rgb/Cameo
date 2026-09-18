@@ -1,0 +1,11 @@
+{
+  "model": "quantized_dynamic_int8_smolvlm256m",
+  "size_mb": 330.613,
+  "model_footprint_mb": 1845.754,
+  "mean_latency_ms": 8990.23,
+  "p95_latency_ms": 9126.682,
+  "peak_memory_mb": 0.414,
+  "bleu4": 0.095,
+  "n_eval_samples": 200,
+  "device": "cpu"
+}

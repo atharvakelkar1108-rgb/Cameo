@@ -1,0 +1,9 @@
+# Minimal dependencies for the Raspberry Pi itself — NOT the same as the
+# main requirements.txt. No pandas/matplotlib/pycocotools/nltk needed here;
+# the Pi only needs to LOAD a model and run inference, not evaluate BLEU or
+# generate plots (that all already happened on your PC).
+torch>=2.1.0
+transformers>=4.38.0
+pillow>=10.0.0
+psutil>=5.9.0
+flask>=3.0.0

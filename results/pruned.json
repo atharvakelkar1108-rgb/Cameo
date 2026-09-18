@@ -1,0 +1,14 @@
+{
+  "model": "pruned_l1_30pct_finetuned_smolvlm256m",
+  "size_mb": 978.599,
+  "baseline_size_mb": 978.599,
+  "model_footprint_mb": 2804.637,
+  "sparsity_pct": 26.5,
+  "mean_latency_ms": 13432.315,
+  "p95_latency_ms": 14472.875,
+  "peak_memory_mb": 0.0,
+  "bleu4": 0.0426,
+  "n_eval_samples": 200,
+  "finetune_samples": 50,
+  "device": "cpu"
+}

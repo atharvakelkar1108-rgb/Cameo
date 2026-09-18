@@ -1,0 +1,5 @@
+stage,model,size_mb,compression_ratio_x,size_reduction_pct,model_footprint_mb,mean_latency_ms,latency_improvement_pct,bleu4,bleu4_diff_vs_baseline,sparsity_pct,total_params,trainable_params,p95_latency_ms,peak_memory_mb,n_eval_samples,device,baseline_size_mb,finetune_samples
+Baseline (FP32),baseline_smolvlm256m_fp32,978.599,1.0,0.0,1276.973,20113.31,0.0,0.0488,0.0,,256484928.0,256484928.0,32326.365,0.0,200,cpu,,
+Quantized (INT8),quantized_dynamic_int8_smolvlm256m,330.613,2.96,66.2,1845.754,8990.23,55.3,0.095,0.0462,,,,9126.682,0.414,200,cpu,,
+Pruned (30%),pruned_l1_30pct_finetuned_smolvlm256m,978.599,1.0,0.0,2804.637,13432.315,33.2,0.0426,-0.0062,26.5,,,14472.875,0.0,200,cpu,978.599,50.0
+Optimized (Pruned + INT8),optimized_pruned30pct_int8_smolvlm256m,330.613,2.96,66.2,1558.125,13650.383,32.1,0.0123,-0.0365,,,,20695.967,0.781,200,cpu,,
