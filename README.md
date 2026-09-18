@@ -10,35 +10,8 @@ quality. A Flask web app provides an interactive image-captioning demo.
 
 ## Repository name
 
-The requested project name is **CAMEO: Compressed AI for Multimodal Edge
-Optimization**. GitHub repository names cannot contain a colon, so use this
-valid repository slug:
-
-```text
-cameo-compressed-ai-for-multimodal-edge-optimization
-```
-
-Keep the full name above as the repository description and README title.
-
-## What belongs in Git
-
-Commit the source code, dependency files, documentation, web app templates,
-and small reproducibility outputs:
-
-- `scripts/`
-- `utils/`
-- `webapp/`
-- `report/`
-- `requirements.txt`
-- `requirements-pi.txt`
-- `README.md`
-- `results/*.json` and `results/comparison.csv`
-
-Do not commit datasets, downloaded images, model weights, virtual
-environments, caches, or generated image plots. These files are excluded by
-`.gitignore`. The `.pt` files currently in `results/` remain on your machine
-but will not be uploaded to GitHub. GitHub is not a suitable model registry;
-use Git LFS or an external model/data store if those artifacts must be shared.
+**CAMEO: Compressed AI for Multimodal Edge
+Optimization**.
 
 ## Setup on Windows
 
