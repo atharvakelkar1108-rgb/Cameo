@@ -532,6 +532,54 @@
             border: 1px solid var(--border);
         }
 
+        .video-preview {
+            display: none;
+        }
+
+        .video-metrics {
+            display: none;
+            margin-top: 14px;
+            padding: 14px;
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            color: var(--muted);
+            font-size: 12px;
+            line-height: 1.7;
+        }
+
+        .video-metrics strong {
+            color: var(--text);
+        }
+
+        .video-evidence {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 12px;
+            margin-top: 14px;
+        }
+
+        .video-evidence-card {
+            overflow: hidden;
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            background: rgba(255,255,255,0.025);
+        }
+
+        .video-evidence-card img {
+            display: block;
+            width: 100%;
+            max-height: 180px;
+            object-fit: contain;
+            background: #050b12;
+        }
+
+        .video-evidence-caption {
+            padding: 10px;
+            color: var(--muted);
+            font-size: 12px;
+            line-height: 1.5;
+        }
+
         .control-group {
             margin-bottom: 17px;
         }
@@ -579,6 +627,7 @@
         .result-text {
             font-size: 17px;
             line-height: 1.65;
+            white-space: pre-line;
             padding: 17px;
             border-radius: 13px;
             background: rgba(70,179,255,0.045);
@@ -1395,6 +1444,13 @@
                                 alt="Preview"
                             >
 
+                            <video
+                                id="videoPreview"
+                                class="video-preview"
+                                controls
+                                playsinline
+                            ></video>
+
                             <div
                                 id="uploadContent"
                             >
@@ -1404,12 +1460,13 @@
                                 </div>
 
                                 <div class="upload-title">
-                                    Upload an image
+                                Upload an image or video
                                 </div>
 
                                 <div class="upload-help">
-                                    JPG, JPEG, PNG or WEBP images can be
-                                    processed by the multimodal model.
+                                Images are captioned directly. Videos are
+                                sampled for scene changes and get one concise
+                                caption for the most eventful frame.
                                 </div>
 
                             </div>
@@ -1417,7 +1474,7 @@
                             <input
                                 type="file"
                                 id="imageInput"
-                                accept="image/*"
+                                accept="image/*,video/*"
                                 hidden
                             >
 
@@ -1427,7 +1484,7 @@
                                     class="btn btn-primary"
                                     onclick="document.getElementById('imageInput').click()"
                                 >
-                                    Choose Image
+                                    Choose Image / Video
                                 </button>
 
                                 <button
@@ -1562,6 +1619,57 @@
 
                             </div>
 
+                            <div class="control-group">
+                                <label class="control-label" for="latencyTarget">
+                                    Maximum model latency (ms, optional)
+                                </label>
+                                <input
+                                    type="number"
+                                    id="latencyTarget"
+                                    min="1"
+                                    step="1"
+                                    placeholder="No limit"
+                                >
+                            </div>
+
+                            <div class="control-group">
+                                <label class="control-label" for="energyBudget">
+                                    CPU energy budget (J/min, optional)
+                                </label>
+                                <input
+                                    type="number"
+                                    id="energyBudget"
+                                    min="0.01"
+                                    step="1"
+                                    placeholder="Requires Intel RAPL"
+                                >
+                                <div class="upload-help">
+                                    When package-energy readings are available,
+                                    excess budget lowers inference frequency.
+                                    High-value or uncertain events still run.
+                                </div>
+                            </div>
+
+                            <div class="control-group">
+                                <label class="control-label" for="qualityRetention">
+                                    Minimum BLEU-4 retention vs. FP32 (0–1)
+                                </label>
+                                <input
+                                    type="number"
+                                    id="qualityRetention"
+                                    min="0"
+                                    max="1"
+                                    step="0.01"
+                                    value="0.90"
+                                >
+                                <div class="upload-help">
+                                    Auto selection excludes variants below this
+                                    benchmark quality floor. Uncertain, query-
+                                    relevant, or audio-confirmed events request
+                                    a stricter, accuracy-first choice.
+                                </div>
+                            </div>
+
 
                             <button
                                 class="btn btn-primary simulate-button"
@@ -1575,7 +1683,7 @@
                                 id="loading"
                             >
                                 <div class="spinner"></div>
-                                Running multimodal inference...
+                                <span id="loadingMessage">Running multimodal inference...</span>
                             </div>
 
                             <div id="errorBox"></div>
@@ -1623,6 +1731,7 @@
                     >
                     </div>
 
+                    <div class="video-evidence" id="videoEvidence"></div>
 
                     <div class="result-stats">
 
@@ -1630,6 +1739,8 @@
                             <span>Latency</span>
                             <strong id="resultLatency">--</strong>
                         </div>
+
+                        <div class="video-metrics" id="videoMetrics"></div>
 
                         <div class="result-stat">
                             <span>Model Size</span>
@@ -2201,7 +2312,7 @@
                 </div>
 
                 <div class="section-description">
-                    Capture an image directly from your camera.
+                    Capture a still image or run event-driven live inference.
                 </div>
             </div>
 
@@ -2229,7 +2340,15 @@
                 Capture Image
             </button>
 
+            <button
+                class="btn"
+                id="cameraLiveBtn"
+            >
+                Start Live Inference
+            </button>
+
         </div>
+        <div class="upload-help" id="cameraStatus" aria-live="polite"></div>
 
         <canvas
             id="cameraCanvas"
@@ -2249,6 +2368,9 @@
 
     let selectedFile = null;
     let cameraStream = null;
+    let cameraInferenceActive = false;
+    let cameraLoopPromise = null;
+    let previewObjectUrl = null;
 
 
     /* =========================================================
@@ -2332,6 +2454,9 @@
     const preview =
         document.getElementById("preview");
 
+    const videoPreview =
+        document.getElementById("videoPreview");
+
     const uploadContent =
         document.getElementById("uploadContent");
 
@@ -2351,10 +2476,22 @@
 
     function showImagePreview(file) {
 
-        const url = URL.createObjectURL(file);
+        if (previewObjectUrl) {
+            URL.revokeObjectURL(previewObjectUrl);
+        }
+        previewObjectUrl = URL.createObjectURL(file);
 
-        preview.src = url;
-        preview.style.display = "block";
+        if (file.type.startsWith("video/")) {
+            preview.style.display = "none";
+            videoPreview.src = previewObjectUrl;
+            videoPreview.style.display = "block";
+        } else {
+            videoPreview.pause();
+            videoPreview.removeAttribute("src");
+            videoPreview.style.display = "none";
+            preview.src = previewObjectUrl;
+            preview.style.display = "block";
+        }
 
         uploadContent.style.display = "none";
 
@@ -2402,6 +2539,12 @@
     const captureBtn =
         document.getElementById("captureBtn");
 
+    const cameraLiveBtn =
+        document.getElementById("cameraLiveBtn");
+
+    const cameraStatus =
+        document.getElementById("cameraStatus");
+
     const cameraCanvas =
         document.getElementById("cameraCanvas");
 
@@ -2433,7 +2576,12 @@
     closeCamera.addEventListener("click", closeCameraModal);
 
 
-    function closeCameraModal() {
+    async function closeCameraModal() {
+
+        cameraInferenceActive = false;
+        if (cameraLoopPromise) {
+            await cameraLoopPromise;
+        }
 
         cameraModal.classList.remove("show");
 
@@ -2496,6 +2644,495 @@
 
     });
 
+    cameraLiveBtn.addEventListener("click", async () => {
+        if (cameraInferenceActive) {
+            cameraInferenceActive = false;
+            cameraStatus.textContent = "Stopping after the current frame...";
+            await cameraLoopPromise;
+            return;
+        }
+        await runLiveCameraInference();
+    });
+
+
+    function videoSettings() {
+        const variant =
+            document.getElementById("variantSelect").value;
+        const latencyValue =
+            document.getElementById("latencyTarget").value;
+        return {
+            variant: variant === "auto" ? "quantized" : variant,
+            adaptive: variant === "auto",
+            priority: document.getElementById("prioritySelect").value,
+            task: taskSelect.value,
+            question: document.getElementById("questionInput").value,
+            max_latency_ms: latencyValue ? Number(latencyValue) : null,
+            energy_budget_j_per_min: document.getElementById("energyBudget").value
+                ? Number(document.getElementById("energyBudget").value)
+                : null,
+            min_quality_retention: Number(
+                document.getElementById("qualityRetention").value
+            )
+        };
+    }
+
+    async function createVideoAudioLookup(file, durationSeconds) {
+        const AudioContextClass =
+            window.AudioContext || window.webkitAudioContext;
+        if (!AudioContextClass || file.size > 24 * 1024 * 1024 ||
+            durationSeconds > 120) {
+            return {
+                available: false,
+                sample: () => null,
+                close: async () => {}
+            };
+        }
+
+        const context = new AudioContextClass();
+        try {
+            const audioBuffer = await context.decodeAudioData(
+                await file.arrayBuffer()
+            );
+            const sample = timestamp => {
+                const sampleRate = audioBuffer.sampleRate;
+                const start = Math.max(
+                    0,
+                    Math.floor((timestamp - 0.1) * sampleRate)
+                );
+                const end = Math.min(
+                    audioBuffer.length,
+                    Math.ceil((timestamp + 0.1) * sampleRate)
+                );
+                if (end <= start) return null;
+                const stride = Math.max(1, Math.floor((end - start) / 2048));
+                let sumSquares = 0;
+                let count = 0;
+                for (let channel = 0;
+                    channel < audioBuffer.numberOfChannels;
+                    channel++) {
+                    const samples = audioBuffer.getChannelData(channel);
+                    for (let index = start; index < end; index += stride) {
+                        sumSquares += samples[index] * samples[index];
+                        count++;
+                    }
+                }
+                return count ? Math.sqrt(sumSquares / count) : null;
+            };
+            return {
+                available: true,
+                sample,
+                close: async () => context.close()
+            };
+        } catch (error) {
+            console.warn("Video audio analysis is unavailable:", error);
+            await context.close();
+            return {
+                available: false,
+                sample: () => null,
+                close: async () => {}
+            };
+        }
+    }
+
+    async function createMicrophoneMeter() {
+        const AudioContextClass =
+            window.AudioContext || window.webkitAudioContext;
+        if (!AudioContextClass || !navigator.mediaDevices?.getUserMedia) {
+            return {
+                available: false,
+                sample: () => null,
+                close: async () => {}
+            };
+        }
+        let stream;
+        let context;
+        try {
+            stream = await navigator.mediaDevices.getUserMedia({audio: true});
+            context = new AudioContextClass();
+            const source = context.createMediaStreamSource(stream);
+            const analyser = context.createAnalyser();
+            analyser.fftSize = 2048;
+            source.connect(analyser);
+            const samples = new Float32Array(analyser.fftSize);
+            return {
+                available: true,
+                sample: () => {
+                    analyser.getFloatTimeDomainData(samples);
+                    let sumSquares = 0;
+                    for (const sample of samples) {
+                        sumSquares += sample * sample;
+                    }
+                    return Math.sqrt(sumSquares / samples.length);
+                },
+                close: async () => {
+                    stream.getTracks().forEach(track => track.stop());
+                    await context.close();
+                }
+            };
+        } catch (error) {
+            if (stream) stream.getTracks().forEach(track => track.stop());
+            if (context) await context.close();
+            return {
+                available: false,
+                sample: () => null,
+                close: async () => {}
+            };
+        }
+    }
+
+
+    async function beginVideoSession(options = {}) {
+        const response = await fetch("/api/video/start", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({...videoSettings(), ...options})
+        });
+        const data = await response.json();
+        if (!response.ok) {
+            throw new Error(data.error || "Could not start video processing.");
+        }
+        return data;
+    }
+
+
+    async function submitVideoFrame(
+        sessionId, blob, timestampSeconds, audioRms = null
+    ) {
+        const body = new FormData();
+        body.append("session_id", sessionId);
+        if (timestampSeconds !== null && timestampSeconds !== undefined) {
+            body.append("timestamp_seconds", String(timestampSeconds));
+        }
+        if (audioRms !== null && Number.isFinite(audioRms)) {
+            body.append("audio_rms", String(audioRms));
+        }
+        body.append("image", blob, "frame.jpg");
+        const response = await fetch("/api/video/frame", {
+            method: "POST",
+            body
+        });
+        const data = await response.json();
+        if (!response.ok) {
+            throw new Error(data.error || "Video frame processing failed.");
+        }
+        return data;
+    }
+
+
+    async function finishVideoSession(sessionId) {
+        const response = await fetch("/api/video/stop", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({session_id: sessionId})
+        });
+        const data = await response.json();
+        if (!response.ok) {
+            throw new Error(data.error || "Could not finish video evaluation.");
+        }
+        return data.metrics;
+    }
+
+
+    function frameBlob(video, canvas) {
+        const scale = Math.min(1, 960 / video.videoWidth);
+        canvas.width = Math.max(1, Math.round(video.videoWidth * scale));
+        canvas.height = Math.max(1, Math.round(video.videoHeight * scale));
+        canvas.getContext("2d").drawImage(
+            video, 0, 0, canvas.width, canvas.height
+        );
+        return new Promise((resolve, reject) => {
+            canvas.toBlob(blob => {
+                if (blob) resolve(blob);
+                else reject(new Error("Could not encode the sampled video frame."));
+            }, "image/jpeg", 0.82);
+        });
+    }
+
+
+    function seekVideo(video, timeSeconds) {
+        return new Promise((resolve, reject) => {
+            if (Math.abs(video.currentTime - timeSeconds) < 0.001 &&
+                !video.seeking) {
+                resolve();
+                return;
+            }
+            const onSeeked = () => {
+                video.removeEventListener("error", onError);
+                resolve();
+            };
+            const onError = () => {
+                video.removeEventListener("seeked", onSeeked);
+                reject(new Error("Could not decode the selected video."));
+            };
+            video.addEventListener("seeked", onSeeked, {once: true});
+            video.addEventListener("error", onError, {once: true});
+            video.currentTime = timeSeconds;
+        });
+    }
+
+
+    function displayVideoSummary(outputs, metrics) {
+        const finalOutputs = outputs.length ? outputs : (metrics.outputs || []);
+        const outputText = formatVideoOutputs(finalOutputs) ||
+            "No VLM descriptions were produced.";
+        displayPrediction({
+            output: outputText,
+            latency_ms: metrics.mean_inference_latency_ms,
+            model_display: metrics.selected_model_display ||
+                "Event-driven video inference",
+            size_mb: metrics.model_size_mb,
+            footprint_mb: metrics.model_footprint_mb
+        });
+        renderVideoEvidence(finalOutputs);
+
+        const energy = metrics.measured_vlm_cpu_package_energy_j == null
+            ? "Unavailable"
+            : `${metrics.measured_vlm_cpu_package_energy_j} J measured`;
+        const baselineEnergy =
+            metrics.estimated_frame_by_frame_vlm_energy_j == null
+                ? "Unavailable"
+                : `${metrics.estimated_frame_by_frame_vlm_energy_j} J estimated`;
+        const container = document.getElementById("videoMetrics");
+        container.innerHTML = [
+            `<strong>Video evaluation</strong>`,
+            `Sampled frames: ${metrics.sampled_frames}`,
+            `VLM calls: ${metrics.vlm_invocations} (${metrics.invocation_reduction_pct}% fewer than frame-by-frame at the same 2 fps sample cadence)`,
+            `VLM inference frequency: ${metrics.inference_frequency_hz} calls/s`,
+            `Model variant: ${escapeHtml(metrics.selected_model_display || metrics.selected_model || "Unavailable")}`,
+            `Minimum BLEU-4 retention: ${metrics.min_quality_retention ?? "--"} (FP32 family baseline)`,
+            `Mean VLM latency: ${metrics.mean_inference_latency_ms ?? "--"} ms; p95: ${metrics.p95_inference_latency_ms ?? "--"} ms`,
+            `Mean frame-gate API time: ${metrics.mean_frame_cycle_ms ?? "--"} ms`,
+            `Estimated frame-by-frame VLM latency: ${metrics.estimated_frame_by_frame_vlm_latency_ms ?? "--"} ms`,
+            `Estimated VLM latency saved: ${metrics.estimated_vlm_latency_saved_ms ?? "--"} ms`,
+            `Mean CPU: ${metrics.mean_cpu_percent ?? "--"}%; mean process RAM: ${metrics.mean_process_ram_mb ?? "--"} MB`,
+            `Recovered skipped frames: ${metrics.recovered_frames ?? 0}; pending recovery buffer: ${metrics.buffered_frames_pending_recovery ?? 0}`,
+            `Audio-visual verified events: ${metrics.audio_visual_events_verified ?? 0}; audio source: ${escapeHtml(metrics.audio_measurement_source || "unavailable")}`,
+            `Query-relevant frames: ${metrics.query_relevant_frames ?? 0}; mean query relevance: ${metrics.mean_query_relevance ?? "--"}`,
+            `Missed-event rate: ${metrics.missed_event_rate == null ? "Requires annotated ground truth (see benchmark)" : `${metrics.missed_event_rate}%`}`,
+            `VLM compute energy: ${escapeHtml(energy)}; frame-by-frame comparison: ${escapeHtml(baselineEnergy)}`,
+            `Estimated VLM energy saved: ${metrics.estimated_vlm_energy_saved_j ?? "Unavailable"} J`,
+            `Energy budget: ${metrics.energy_budget_j_per_min ?? "Not set"} J/min; rolling debt: ${metrics.energy_debt_j ?? "--"} J`,
+            `Energy controller: ${metrics.energy_controller_active ? "Active" : (metrics.energy_budget_j_per_min ? "Inactive: reliable meter unavailable" : "Not configured")}`,
+            `Learned event threshold: ${metrics.learned_event_threshold ?? "--"} (${metrics.threshold_updates ?? 0} caption-feedback updates)`,
+            `Mean event value: ${metrics.mean_event_value ?? "--"}; estimated information benefit: ${metrics.mean_expected_information_benefit ?? "--"}`,
+            `Estimated inference cost: ${metrics.estimated_inference_latency_cost_ms ?? "--"} ms; ${metrics.estimated_inference_energy_cost_j ?? "Unavailable"} J`,
+            `Detailed inferences: ${metrics.detailed_inferences ?? 0}`,
+            `Energy source: ${escapeHtml(metrics.energy_measurement)}`
+        ].map(line => `<div>${line}</div>`).join("");
+        container.style.display = "block";
+    }
+
+    function formatVideoOutputs(outputs) {
+        return outputs.map(item => {
+            const time = item.timestamp_seconds == null
+                ? ""
+                : `[${Number(item.timestamp_seconds).toFixed(1)}s] `;
+            return `${time}${item.answer}`;
+        }).join("\n\n");
+    }
+
+    function renderVideoEvidence(outputs) {
+        const container = document.getElementById("videoEvidence");
+        container.replaceChildren();
+        outputs.forEach(item => {
+            if (!item.keyframe_data_url) return;
+            const card = document.createElement("div");
+            card.className = "video-evidence-card";
+            const image = document.createElement("img");
+            image.src = item.keyframe_data_url;
+            image.alt = `Keyframe evidence at ${item.timestamp_seconds ?? "unknown"} seconds`;
+            const caption = document.createElement("div");
+            caption.className = "video-evidence-caption";
+            const timestamp = item.timestamp_seconds == null
+                ? "Timestamp unavailable"
+                : `${Number(item.timestamp_seconds).toFixed(2)}s`;
+            const labels = [
+                timestamp,
+                item.recovered ? "Recovered skipped frame" : "Inferred keyframe",
+                item.reason || "event",
+                item.audio_visual_verified ? "Audio-visual corroborated" : "Visual evidence"
+            ];
+            caption.textContent = `${labels.join(" · ")} — ${item.answer || ""}`;
+            card.append(image, caption);
+            container.append(card);
+        });
+    }
+
+
+    function showVideoProgress(outputs, frameNumber, frameCount) {
+        const resultCard = document.getElementById("resultCard");
+        resultCard.style.display = "block";
+        document.getElementById("videoMetrics").style.display = "none";
+        document.getElementById("resultText").textContent =
+            formatVideoOutputs(outputs) ||
+            "Scanning for the most eventful frame. One VLM caption will be generated after the scan.";
+        renderVideoEvidence(outputs);
+        document.getElementById("resultModelBadge").textContent =
+            "Event-driven video inference";
+        loadingMessage.textContent =
+            `Scanning sampled frame ${frameNumber} of ${frameCount}; ` +
+            "one caption will be generated after the scan.";
+    }
+
+
+    async function processUploadedVideo(file) {
+        let sessionId = null;
+        let sessionFinished = false;
+        let audioLookup = null;
+        const outputs = [];
+        const decoder = document.createElement("video");
+        decoder.muted = true;
+        decoder.preload = "auto";
+        decoder.src = URL.createObjectURL(file);
+        const canvas = document.createElement("canvas");
+        try {
+            await new Promise((resolve, reject) => {
+                decoder.addEventListener("loadedmetadata", resolve, {once: true});
+                decoder.addEventListener(
+                    "error",
+                    () => reject(new Error("Could not open the selected video.")),
+                    {once: true}
+                );
+            });
+            if (decoder.readyState < 2) {
+                await new Promise((resolve, reject) => {
+                    decoder.addEventListener("loadeddata", resolve, {once: true});
+                    decoder.addEventListener(
+                        "error",
+                        () => reject(new Error("Could not decode the selected video.")),
+                        {once: true}
+                    );
+                });
+            }
+            if (!Number.isFinite(decoder.duration) || decoder.duration <= 0) {
+                throw new Error("The selected video has no readable duration.");
+            }
+            audioLookup = await createVideoAudioLookup(file, decoder.duration);
+            const session = await beginVideoSession({
+                single_result: true,
+                audio_source: audioLookup.available
+                    ? "browser decoded file audio"
+                    : "unavailable"
+            });
+            sessionId = session.session_id;
+            const interval = session.sample_interval_ms / 1000;
+            const timestamps = [];
+            for (let time = 0; time < decoder.duration; time += interval) {
+                timestamps.push(time);
+            }
+            const finalFrame = Math.max(0, decoder.duration - 0.001);
+            if (!timestamps.length ||
+                finalFrame - timestamps[timestamps.length - 1] > interval * 0.5) {
+                timestamps.push(finalFrame);
+            }
+            showVideoProgress(outputs, 0, timestamps.length);
+            for (let index = 0; index < timestamps.length; index++) {
+                loadingMessage.textContent =
+                    `Analyzing sampled frame ${index + 1} of ${timestamps.length}; ` +
+                    `${outputs.length} VLM result(s) received so far.`;
+                await seekVideo(decoder, timestamps[index]);
+                const result = await submitVideoFrame(
+                    sessionId,
+                    await frameBlob(decoder, canvas),
+                    timestamps[index],
+                    audioLookup.sample(timestamps[index])
+                );
+                if (result.should_infer) {
+                    outputs.push(result);
+                    showVideoProgress(outputs, index + 1, timestamps.length);
+                }
+            }
+            loadingMessage.textContent =
+                "Selected the most eventful frame; generating one caption...";
+            const metrics = await finishVideoSession(sessionId);
+            sessionFinished = true;
+            displayVideoSummary(outputs, metrics);
+            loadSystemStats();
+        } finally {
+            if (audioLookup) await audioLookup.close();
+            URL.revokeObjectURL(decoder.src);
+            if (sessionId && !sessionFinished) {
+                try {
+                    await finishVideoSession(sessionId);
+                } catch (error) {
+                    console.warn("Could not close the interrupted video session:", error);
+                }
+            }
+        }
+    }
+
+
+    async function runLiveCameraInference() {
+        let sessionId = null;
+        let sessionFinished = false;
+        let audioMeter = null;
+        const outputs = [];
+        const canvas = document.createElement("canvas");
+        cameraInferenceActive = true;
+        cameraLiveBtn.textContent = "Stop Live Inference";
+        captureBtn.disabled = true;
+        cameraStatus.textContent =
+            "Sampling camera frames; VLM runs only for scene changes or heartbeat frames.";
+        cameraLoopPromise = (async () => {
+            try {
+                audioMeter = await createMicrophoneMeter();
+                cameraStatus.textContent = audioMeter.available
+                    ? "Sampling camera and microphone; VLM runs on verified events or heartbeat frames."
+                    : "Microphone unavailable; continuing with visual-only event detection.";
+                const session = await beginVideoSession({
+                    single_result: false,
+                    audio_source: audioMeter.available
+                        ? "browser microphone"
+                        : "unavailable"
+                });
+                sessionId = session.session_id;
+                const streamStartedAt = performance.now();
+                while (cameraInferenceActive && cameraStream && cameraVideo.videoWidth) {
+                    const result = await submitVideoFrame(
+                        sessionId,
+                        await frameBlob(cameraVideo, canvas),
+                        (performance.now() - streamStartedAt) / 1000,
+                        audioMeter.sample()
+                    );
+                    if (result.should_infer) {
+                        outputs.push(...(result.recovered_outputs || []));
+                        outputs.push(result);
+                        cameraStatus.textContent =
+                            `VLM invoked ${result.vlm_invocations} time(s); latest event: ${result.reason}${result.uncertain_event ? " (detailed analysis)" : ""}.`;
+                    } else if (result.reason === "energy_budget") {
+                        cameraStatus.textContent =
+                            `Energy budget is exceeded by ${result.energy_debt_j} J; low-value event deferred.`;
+                    }
+                    await new Promise(resolve =>
+                        setTimeout(resolve, session.sample_interval_ms)
+                    );
+                }
+                const metrics = await finishVideoSession(sessionId);
+                sessionFinished = true;
+                displayVideoSummary(outputs, metrics);
+                loadSystemStats();
+            } catch (error) {
+                cameraStatus.textContent = error.message;
+                errorBox.innerHTML =
+                    `<div class="error">${escapeHtml(error.message)}</div>`;
+            } finally {
+                if (audioMeter) await audioMeter.close();
+                cameraInferenceActive = false;
+                cameraLiveBtn.textContent = "Start Live Inference";
+                captureBtn.disabled = false;
+                if (sessionId && !sessionFinished) {
+                    try {
+                        await finishVideoSession(sessionId);
+                    } catch (error) {
+                        console.warn("Could not close the interrupted camera session:", error);
+                    }
+                }
+                cameraLoopPromise = null;
+            }
+        })();
+        await cameraLoopPromise;
+    }
+
 
     /* =========================================================
        RUN INFERENCE
@@ -2506,6 +3143,9 @@
 
     const loading =
         document.getElementById("loading");
+
+    const loadingMessage =
+        document.getElementById("loadingMessage");
 
     const errorBox =
         document.getElementById("errorBox");
@@ -2524,6 +3164,23 @@
 
         }
 
+        if (selectedFile.type.startsWith("video/")) {
+            runBtn.disabled = true;
+            loading.classList.add("show");
+            loadingMessage.textContent =
+                "Opening video and preparing event-driven inference...";
+            try {
+                await processUploadedVideo(selectedFile);
+            } catch (error) {
+                errorBox.innerHTML =
+                    `<div class="error">${escapeHtml(error.message)}</div>`;
+            } finally {
+                runBtn.disabled = false;
+                loading.classList.remove("show");
+                loadingMessage.textContent = "Running multimodal inference...";
+            }
+            return;
+        }
 
         const formData =
             new FormData();
@@ -2581,10 +3238,16 @@
             question
         );
 
+        const latencyTarget =
+            document.getElementById("latencyTarget").value;
+        if (latencyTarget) {
+            formData.append("max_latency_ms", latencyTarget);
+        }
 
         runBtn.disabled = true;
 
         loading.classList.add("show");
+        loadingMessage.textContent = "Running multimodal inference...";
 
 
         try {
@@ -2652,6 +3315,8 @@
 
 
         resultCard.style.display = "block";
+        document.getElementById("videoMetrics").style.display = "none";
+        document.getElementById("videoEvidence").replaceChildren();
 
         document.getElementById("resultText").textContent =
             data.output ||

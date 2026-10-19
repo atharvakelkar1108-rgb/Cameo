@@ -6,7 +6,13 @@ import os
 import sys
 import gc
 import json
+import math
+import re
 import time
+import threading
+import uuid
+import base64
+from io import BytesIO
 from pathlib import Path
 
 import torch
@@ -36,7 +42,14 @@ sys.path.insert(
 # PROJECT IMPORTS
 # ============================================================
 
-from utils.model_selector import select_model
+from utils.model_selector import load_model_profiles, select_model
+from utils.video_pipeline import (
+    FRAME_CHANGE_THRESHOLD,
+    MAX_INFERENCE_INTERVAL_SECONDS,
+    VideoSession,
+    energy_delta_joules,
+    read_cpu_energy_joules,
+)
 
 
 # ============================================================
@@ -85,6 +98,9 @@ except RuntimeError:
 MODEL_CACHE = {}
 
 PROCESSOR_CACHE = {}
+
+VIDEO_SESSIONS = {}
+VIDEO_SESSIONS_LOCK = threading.Lock()
 
 
 # ============================================================
@@ -605,7 +621,10 @@ def get_system_stats():
 # ============================================================
 
 def perform_selection(
-    priority
+    priority,
+    max_latency_ms=None,
+    energy_profiles=None,
+    min_quality_retention=None,
 ):
 
     stats = (
@@ -664,6 +683,14 @@ def perform_selection(
     # Existing project selector
     # --------------------------------------------------------
 
+    selection_priority = priority
+    if (
+        stats["cpu_percent"] >= 85
+        and available_ram >= 1000
+        and priority in ("auto", "balanced")
+    ):
+        selection_priority = "fast"
+
     selection = select_model(
 
         ram_available_mb=
@@ -673,11 +700,39 @@ def perform_selection(
             cpu_cores,
 
         priority=
-            priority,
+            selection_priority,
 
         max_latency_ms=
-            None
+            max_latency_ms,
+
+        min_quality_retention=
+            min_quality_retention,
     )
+
+    measured_energy = energy_profiles or {}
+    if (
+        priority in ("auto", "balanced", "accuracy")
+        and len(measured_energy) >= 2
+        and not (selection_priority == "fast" and max_latency_ms is None)
+    ):
+        profiles = load_model_profiles()
+        eligible = [
+            key
+            for key in selection.get("candidates", [])
+            if key in measured_energy and key in profiles
+        ]
+        if len(eligible) >= 2:
+            energy_selected = min(
+                eligible,
+                key=lambda key: measured_energy[key],
+            )
+            selection["selected"] = energy_selected
+            selection["profile"] = profiles[energy_selected]
+            selection["explanation"] += (
+                f" Selected for lowest measured CPU-package energy "
+                f"({measured_energy[energy_selected]:.4f} J/inference)."
+            )
+            selection["energy_aware"] = True
 
 
     print(
@@ -784,7 +839,9 @@ def generate_answer(
 
     task="caption",
 
-    question=""
+    question="",
+
+    detailed=False,
 
 ):
 
@@ -794,10 +851,18 @@ def generate_answer(
 
     if task == "caption":
 
-        prompt = (
-            "Describe this image "
-            "in one sentence."
-        )
+        if detailed:
+            prompt = (
+                "Carefully inspect the image for the main subject, its action, "
+                "and relevant scene details. Give one complete, factual caption "
+                "of at most 24 words. Do not answer a question or give a number. "
+                "Return only the caption."
+            )
+        else:
+            prompt = (
+                "Describe the main subject in one complete, concise sentence "
+                "of at most 18 words. Return only that sentence."
+            )
 
 
     # --------------------------------------------------------
@@ -827,164 +892,97 @@ def generate_answer(
     else:
 
         prompt = (
-            "Describe this image "
-            "in one sentence."
+            "Describe the main subject in one complete, concise sentence "
+            "of at most 18 words. Return only that sentence."
         )
 
 
-    # --------------------------------------------------------
-    # Multimodal conversation
-    # --------------------------------------------------------
-
-    messages = [
-
-        {
-
-            "role":
-                "user",
-
+    def run_generation(generation_prompt: str, max_new_tokens: int) -> str:
+        messages = [{
+            "role": "user",
             "content": [
-
-                {
-                    "type":
-                        "image"
-                },
-
-                {
-
-                    "type":
-                        "text",
-
-                    "text":
-                        prompt
-                }
-
-            ]
-        }
-
-    ]
-
-
-    # --------------------------------------------------------
-    # Create prompt
-    # --------------------------------------------------------
-
-    text = (
-        processor.apply_chat_template(
-
+                {"type": "image"},
+                {"type": "text", "text": generation_prompt},
+            ],
+        }]
+        text = processor.apply_chat_template(
             messages,
-
-            add_generation_prompt=True
+            add_generation_prompt=True,
         )
-    )
-
-
-    # --------------------------------------------------------
-    # Processor
-    # --------------------------------------------------------
-
-    inputs = processor(
-
-        text=text,
-
-        images=[image],
-
-        return_tensors="pt"
-    )
-
-
-    # --------------------------------------------------------
-    # Move tensors
-    # --------------------------------------------------------
-
-    inputs = {
-
-        key: (
-
-            value.to(DEVICE)
-
-            if hasattr(
-                value,
-                "to"
-            )
-
-            else value
-
+        inputs = processor(
+            text=text,
+            images=[image],
+            return_tensors="pt",
         )
-
-        for key, value
-        in inputs.items()
-    }
-
-
-    # --------------------------------------------------------
-    # Generation
-    # --------------------------------------------------------
-
-    with torch.no_grad():
-
-        generated_ids = (
-            model.generate(
-
+        inputs = {
+            key: value.to(DEVICE) if hasattr(value, "to") else value
+            for key, value in inputs.items()
+        }
+        with torch.no_grad():
+            generated_ids = model.generate(
                 **inputs,
-
-                max_new_tokens=30,
-
+                max_new_tokens=max_new_tokens,
                 do_sample=False,
-
                 use_cache=True,
+                eos_token_id=processor.tokenizer.eos_token_id,
+                pad_token_id=processor.tokenizer.pad_token_id,
+            )
+        input_length = inputs["input_ids"].shape[1]
+        generated_tokens = generated_ids[:, input_length:]
+        return processor.batch_decode(
+            generated_tokens,
+            skip_special_tokens=True,
+        )[0].strip()
 
-                eos_token_id=(
-                    processor
-                    .tokenizer
-                    .eos_token_id
-                ),
+    def clean_caption(raw_answer: str) -> str:
+        answer = re.sub(
+            r"^(?:(?:the\s+)?answer\s+is|answer|a)\s*:\s*",
+            "",
+            raw_answer.strip(),
+            count=1,
+            flags=re.IGNORECASE,
+        )
+        answer = re.sub(r"\s+", " ", answer).strip(" \t\r\n\"'")
+        complete_sentence = re.search(r"^(.+?[.!?])(?:\s|$)", answer)
+        if complete_sentence:
+            answer = complete_sentence.group(1)
+        elif answer and answer[-1] not in ".!?":
+            answer += "."
+        return answer
 
-                pad_token_id=(
-                    processor
-                    .tokenizer
-                    .pad_token_id
-                )
+    answer = run_generation(
+        prompt,
+        max_new_tokens=64 if detailed else (
+            48 if task == "caption" else 64
+        ),
+    )
+    if task != "caption":
+        return answer
+
+    answer = clean_caption(answer)
+    def is_caption(value: str) -> bool:
+        return (
+            len(re.findall(r"[A-Za-z]{2,}", value)) >= 3
+            and not re.fullmatch(r"[\W\d_]+", value)
+            and not re.match(
+                r"^(?:the\s+)?answer\s+is\b",
+                value,
+                re.IGNORECASE,
             )
         )
 
-
-    # --------------------------------------------------------
-    # Remove prompt
-    # --------------------------------------------------------
-
-    input_length = (
-        inputs[
-            "input_ids"
-        ].shape[1]
-    )
-
-
-    generated_tokens = (
-
-        generated_ids[
-            :,
-            input_length:
-        ]
-
-    )
-
-
-    # --------------------------------------------------------
-    # Decode
-    # --------------------------------------------------------
-
-    answer = (
-        processor.batch_decode(
-
-            generated_tokens,
-
-            skip_special_tokens=True
-        )[0]
-    )
-
-
-    return answer.strip()
+    if not is_caption(answer):
+        answer = clean_caption(run_generation(
+            "Do not answer with a number or answer label. Describe the visible "
+            "objects, scene, or action in one complete, factual sentence of "
+            "at most 18 words. Return only the caption.",
+            max_new_tokens=48,
+        ))
+        if not is_caption(answer):
+            answer = (
+                "The model could not produce a reliable caption for this frame."
+            )
+    return answer
 
 
 # ============================================================
@@ -1582,6 +1580,24 @@ def predict():
             ""
         )
 
+        max_latency_value = request.form.get("max_latency_ms")
+        try:
+            max_latency_ms = (
+                float(max_latency_value)
+                if max_latency_value
+                else None
+            )
+        except ValueError:
+            return jsonify({
+                "error": "Latency target must be a positive number."
+            }), 400
+        if max_latency_ms is not None and (
+            max_latency_ms <= 0 or not math.isfinite(max_latency_ms)
+        ):
+            return jsonify({
+                "error": "Latency target must be a positive number."
+            }), 400
+
 
         valid_priorities = {
 
@@ -1617,7 +1633,8 @@ def predict():
 
             selector_result = (
                 perform_selection(
-                    priority
+                    priority,
+                    max_latency_ms,
                 )
             )
 
@@ -1675,6 +1692,26 @@ def predict():
                     )
 
             }), 400
+
+        if max_latency_ms is not None:
+            measured_latency = load_result_info(selected_key).get(
+                "mean_latency_ms"
+            )
+            if not isinstance(measured_latency, (int, float)):
+                return jsonify({
+                    "error": (
+                        f"No benchmark latency is available for {selected_key}; "
+                        "cannot enforce the requested latency target."
+                    )
+                }), 422
+            if measured_latency > max_latency_ms:
+                return jsonify({
+                    "error": (
+                        f"No selected model meets the {max_latency_ms:g} ms "
+                        f"latency target; {selected_key} is benchmarked at "
+                        f"{measured_latency:g} ms."
+                    )
+                }), 422
 
 
         # ----------------------------------------------------
@@ -1973,6 +2010,538 @@ def predict():
                 str(e)
 
         }), 500
+
+
+# ============================================================
+# EVENT-DRIVEN VIDEO AND CAMERA API
+# ============================================================
+
+def encode_video_evidence(image):
+    thumbnail = image.copy()
+    thumbnail.thumbnail((480, 480), Image.Resampling.LANCZOS)
+    buffer = BytesIO()
+    thumbnail.save(buffer, format="JPEG", quality=76)
+    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+    return f"data:image/jpeg;base64,{encoded}"
+
+
+def infer_video_candidate(
+    video_session,
+    image,
+    timestamp_seconds,
+    analysis,
+    recovered=False,
+):
+    settings = video_session.settings
+    selector_result = None
+    if settings["adaptive"]:
+        uncertain_or_verified = (
+            analysis.get("uncertain", False)
+            or analysis.get("audio_visual_verified", False)
+            or analysis.get("query_relevance", 0.0) >= 0.75
+        )
+        quality_retention = min(
+            1.0,
+            round(
+                settings["min_quality_retention"]
+                + (0.05 if uncertain_or_verified else 0.0),
+                4,
+            ),
+        )
+        selection_priority = (
+            "accuracy" if uncertain_or_verified else settings["priority"]
+        )
+        selector_result = perform_selection(
+            selection_priority,
+            settings["max_latency_ms"],
+            video_session.energy_profiles(),
+            min_quality_retention=quality_retention,
+        )
+        selected_key = selector_result.get("selected")
+        if selected_key is None:
+            return {
+                "error": selector_result.get(
+                    "explanation", "No suitable model variant is available."
+                )
+            }, 422
+    else:
+        selected_key = settings["variant"]
+
+    result_info = load_result_info(selected_key)
+    measured_latency = result_info.get("mean_latency_ms")
+    latency_target = settings["max_latency_ms"]
+    if latency_target is not None and not isinstance(
+        measured_latency, (int, float)
+    ):
+        return {
+            "error": (
+                f"No benchmark latency is available for {selected_key}; "
+                "cannot enforce the requested latency target."
+            )
+        }, 422
+    if latency_target is not None and measured_latency > latency_target:
+        return {
+            "error": (
+                f"No selected model meets the {latency_target:g} ms latency "
+                f"target; {selected_key} is benchmarked at "
+                f"{measured_latency:g} ms."
+            )
+        }, 422
+
+    stats = get_system_stats()
+    video_session.record_resources(
+        stats["cpu_percent"], stats["process_rss_mb"]
+    )
+    model = load_model(selected_key)
+    processor = load_processor()
+    profile = selector_result.get("profile", {}) if selector_result else {}
+    resolution = profile.get(
+        "input_resolution", MODEL_INFO[selected_key]["resolution"]
+    )
+    prepared_image = prepare_image(image, int(resolution))
+    energy_start = read_cpu_energy_joules()
+    inference_started = time.perf_counter()
+    answer = generate_answer(
+        model,
+        processor,
+        prepared_image,
+        settings["task"],
+        settings["question"],
+        detailed=analysis.get("detailed_analysis", False),
+    )
+    latency_ms = (time.perf_counter() - inference_started) * 1000
+    energy_joules = energy_delta_joules(
+        energy_start, read_cpu_energy_joules()
+    )
+    post_inference_stats = get_system_stats()
+    video_session.record_resources(
+        post_inference_stats["cpu_percent"],
+        post_inference_stats["process_rss_mb"],
+    )
+    evidence = encode_video_evidence(image)
+    video_session.record_inference(
+        image,
+        time.monotonic(),
+        latency_ms,
+        selected_key,
+        answer,
+        energy_joules,
+        timestamp_seconds,
+        detailed=analysis.get("detailed_analysis", False),
+        evidence_data_url=evidence,
+        audio_visual_verified=analysis.get("audio_visual_verified", False),
+        recovered=recovered,
+        reason=analysis.get("reason"),
+    )
+    if recovered:
+        video_session.recovered_frame_count += 1
+
+    return {
+        "answer": answer,
+        "model": selected_key,
+        "model_display": MODEL_INFO[selected_key]["display_name"],
+        "latency_ms": round(latency_ms, 3),
+        "energy_joules": energy_joules,
+        "selector": selector_result,
+        "timestamp_seconds": timestamp_seconds,
+        "keyframe_data_url": evidence,
+        "detailed_analysis": analysis.get("detailed_analysis", False),
+        "audio_visual_verified": analysis.get(
+            "audio_visual_verified", False
+        ),
+        "recovered": recovered,
+        "reason": analysis.get("reason"),
+        "query_relevance": analysis.get("query_relevance", 0.0),
+    }, 200
+
+
+@app.route("/api/video/start", methods=["POST"])
+def start_video_session():
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({"error": "Expected a JSON configuration object."}), 400
+
+    variant = str(payload.get("variant", "quantized")).lower()
+    priority = str(payload.get("priority", "auto")).lower()
+    task = str(payload.get("task", "caption")).lower()
+    adaptive = payload.get("adaptive") is True
+    max_latency_ms = payload.get("max_latency_ms")
+    energy_budget = payload.get("energy_budget_j_per_min")
+    min_quality_retention = payload.get("min_quality_retention", 0.9)
+    benchmark_mode = payload.get("benchmark_mode", "adaptive")
+    audio_source = payload.get("audio_source", "unavailable")
+    if variant not in MODEL_INFO:
+        return jsonify({"error": "Invalid model variant."}), 400
+    if priority not in {"auto", "fast", "balanced", "accuracy", "memory"}:
+        return jsonify({"error": "Invalid optimization priority."}), 400
+    if task not in {"caption", "vqa"}:
+        return jsonify({"error": "Task must be caption or vqa."}), 400
+    if not isinstance(benchmark_mode, str) or benchmark_mode not in {
+        "adaptive", "frame_by_frame"
+    }:
+        return jsonify({"error": "Invalid video benchmark mode."}), 400
+    if not isinstance(audio_source, str) or audio_source not in {
+        "unavailable", "browser decoded file audio", "browser microphone"
+    }:
+        return jsonify({"error": "Invalid audio measurement source."}), 400
+    try:
+        min_quality_retention = float(min_quality_retention)
+    except (TypeError, ValueError):
+        return jsonify({
+            "error": "Minimum quality retention must be between 0 and 1."
+        }), 400
+    if (
+        not math.isfinite(min_quality_retention)
+        or not 0 <= min_quality_retention <= 1
+    ):
+        return jsonify({
+            "error": "Minimum quality retention must be between 0 and 1."
+        }), 400
+    if max_latency_ms is not None:
+        try:
+            max_latency_ms = float(max_latency_ms)
+        except (TypeError, ValueError):
+            return jsonify({"error": "Latency target must be a positive number."}), 400
+        if max_latency_ms <= 0 or not math.isfinite(max_latency_ms):
+            return jsonify({"error": "Latency target must be a positive number."}), 400
+    if energy_budget is not None:
+        try:
+            energy_budget = float(energy_budget)
+        except (TypeError, ValueError):
+            return jsonify({
+                "error": "Energy budget must be a positive number of joules per minute."
+            }), 400
+        if energy_budget <= 0 or not math.isfinite(energy_budget):
+            return jsonify({
+                "error": "Energy budget must be a positive number of joules per minute."
+            }), 400
+
+    now = time.monotonic()
+    with VIDEO_SESSIONS_LOCK:
+        expired = [
+            key
+            for key, session in VIDEO_SESSIONS.items()
+            if now - session.started_at > 3600
+        ]
+        for key in expired:
+            del VIDEO_SESSIONS[key]
+        if len(VIDEO_SESSIONS) >= 20:
+            return jsonify({
+                "error": "Video processing is busy; try again when a session finishes."
+            }), 429
+
+        session_id = uuid.uuid4().hex
+        VIDEO_SESSIONS[session_id] = VideoSession(settings={
+            "variant": variant,
+            "priority": priority,
+            "task": task,
+            "question": str(payload.get("question", ""))[:500],
+            "adaptive": adaptive,
+            "max_latency_ms": max_latency_ms,
+            "single_result": payload.get("single_result") is True,
+            "energy_budget_j_per_min": energy_budget,
+            "min_quality_retention": min_quality_retention,
+            "benchmark_mode": benchmark_mode,
+            "audio_source": audio_source,
+        })
+
+    return jsonify({
+        "session_id": session_id,
+        "sample_interval_ms": 500,
+        "event_threshold": FRAME_CHANGE_THRESHOLD,
+        "heartbeat_seconds": MAX_INFERENCE_INTERVAL_SECONDS,
+    })
+
+
+@app.route("/api/video/frame", methods=["POST"])
+def process_video_frame():
+    session_id = request.form.get("session_id", "")
+    with VIDEO_SESSIONS_LOCK:
+        video_session = VIDEO_SESSIONS.get(session_id)
+    if video_session is None:
+        return jsonify({"error": "Video session not found or expired."}), 404
+    if "image" not in request.files:
+        return jsonify({"error": "No video frame was uploaded."}), 400
+    if request.content_length and request.content_length > 8 * 1024 * 1024:
+        return jsonify({"error": "Video frame exceeds the 8 MB upload limit."}), 413
+
+    try:
+        image = Image.open(request.files["image"].stream).convert("RGB")
+    except (OSError, Image.DecompressionBombError) as error:
+        return jsonify({"error": f"Could not read video frame: {error}"}), 400
+
+    timestamp_value = request.form.get("timestamp_seconds")
+    try:
+        timestamp_seconds = (
+            float(timestamp_value) if timestamp_value is not None else None
+        )
+    except ValueError:
+        return jsonify({"error": "Frame timestamp must be numeric."}), 400
+    if timestamp_seconds is not None and (
+        not math.isfinite(timestamp_seconds) or timestamp_seconds < 0
+    ):
+        return jsonify({"error": "Frame timestamp must be non-negative."}), 400
+    audio_rms_value = request.form.get("audio_rms")
+    try:
+        audio_rms = (
+            float(audio_rms_value) if audio_rms_value is not None else None
+        )
+    except ValueError:
+        return jsonify({"error": "Audio RMS must be numeric."}), 400
+    if audio_rms is not None and (
+        not math.isfinite(audio_rms) or not 0 <= audio_rms <= 1
+    ):
+        return jsonify({"error": "Audio RMS must be between 0 and 1."}), 400
+
+    frame_started = time.perf_counter()
+    stats = get_system_stats()
+    video_session.record_resources(
+        stats["cpu_percent"],
+        stats["process_rss_mb"],
+    )
+    analysis = video_session.analyze_frame(
+        image,
+        timestamp_seconds=timestamp_seconds,
+        audio_rms=audio_rms,
+    )
+    if not analysis["should_infer"]:
+        video_session.frame_processing_ms.append(
+            (time.perf_counter() - frame_started) * 1000
+        )
+        return jsonify({
+            "success": True,
+            "should_infer": False,
+            "reason": analysis["reason"],
+            "mean_difference": round(analysis["mean_difference"], 4),
+            "changed_fraction": round(analysis["changed_fraction"], 4),
+            "event_value": round(analysis.get("event_value", 0.0), 3),
+            "expected_information_benefit": round(
+                analysis.get("expected_information_benefit", 0.0), 3
+            ),
+            "benefit_cost_ratio": analysis.get("benefit_cost_ratio"),
+            "estimated_latency_cost_ms": analysis.get(
+                "estimated_latency_cost_ms"
+            ),
+            "estimated_energy_cost_j": analysis.get(
+                "estimated_energy_cost_j"
+            ),
+            "uncertain": analysis.get("uncertain", False),
+            "query_relevance": round(
+                analysis.get("query_relevance", 0.0), 3
+            ),
+            "audio_visual_verified": analysis.get(
+                "audio_visual_verified", False
+            ),
+            "energy_debt_j": round(analysis.get("energy_debt_j", 0.0), 4),
+            "effective_threshold": round(
+                analysis.get("effective_threshold", 1.0), 3
+            ),
+            "sampled_frames": video_session.total_frames,
+        })
+
+    try:
+        recovery = video_session.take_recovery_candidate(
+            current_timestamp_seconds=timestamp_seconds
+        )
+        recovered_outputs = []
+        if recovery:
+            recovered_result, status = infer_video_candidate(
+                video_session,
+                recovery["image"],
+                recovery["timestamp_seconds"],
+                recovery,
+                recovered=True,
+            )
+            if status != 200:
+                return jsonify(recovered_result), status
+            recovered_outputs.append(recovered_result)
+        result, status = infer_video_candidate(
+            video_session, image, timestamp_seconds, analysis
+        )
+        if status != 200:
+            return jsonify(result), status
+    except Exception as error:
+        app.logger.exception("Video-frame inference failed")
+        return jsonify({"error": str(error)}), 500
+
+    video_session.frame_processing_ms.append(
+        (time.perf_counter() - frame_started) * 1000
+    )
+    return jsonify({
+        "success": True,
+        "should_infer": True,
+        "reason": analysis["reason"],
+        "mean_difference": round(analysis["mean_difference"], 4),
+        "changed_fraction": round(analysis["changed_fraction"], 4),
+        **result,
+        "answer": result["answer"],
+        "recovered_outputs": recovered_outputs,
+        "detailed_analysis": analysis.get("detailed_analysis", False),
+        "uncertain_event": analysis.get("uncertain", False),
+        "audio_visual_verified": analysis.get(
+            "audio_visual_verified", False
+        ),
+        "query_relevance": round(
+            analysis.get("query_relevance", 0.0), 3
+        ),
+        "event_value": round(analysis.get("event_value", 0.0), 3),
+        "expected_information_benefit": round(
+            analysis.get("expected_information_benefit", 0.0), 3
+        ),
+        "benefit_cost_ratio": analysis.get("benefit_cost_ratio"),
+        "estimated_latency_cost_ms": analysis.get(
+            "estimated_latency_cost_ms"
+        ),
+        "estimated_energy_cost_j": analysis.get(
+            "estimated_energy_cost_j"
+        ),
+        "energy_debt_j": round(analysis.get("energy_debt_j", 0.0), 4),
+        "sampled_frames": video_session.total_frames,
+        "vlm_invocations": video_session.inference_count,
+    })
+
+
+@app.route("/api/video/stop", methods=["POST"])
+def stop_video_session():
+    payload = request.get_json(silent=True)
+    session_id = payload.get("session_id") if isinstance(payload, dict) else None
+    with VIDEO_SESSIONS_LOCK:
+        video_session = VIDEO_SESSIONS.pop(session_id, None)
+    if video_session is None:
+        return jsonify({"error": "Video session not found or already stopped."}), 404
+
+    if video_session.settings.get("single_result") and video_session.best_frame:
+        settings = video_session.settings
+        selector_result = None
+        if settings["adaptive"]:
+            stricter_quality = (
+                video_session.best_frame_detailed
+                or video_session.best_frame_audio_verified
+            )
+            selector_result = perform_selection(
+                "accuracy" if stricter_quality else settings["priority"],
+                settings["max_latency_ms"],
+                video_session.energy_profiles(),
+                min_quality_retention=min(
+                    1.0,
+                    round(
+                        settings["min_quality_retention"]
+                        + (0.05 if stricter_quality else 0.0),
+                        4,
+                    ),
+                ),
+            )
+            model_key = selector_result.get("selected")
+            if model_key is None:
+                return jsonify({
+                    "error": selector_result.get(
+                        "explanation", "No suitable model variant is available."
+                    )
+                }), 422
+        else:
+            model_key = settings["variant"]
+
+        if model_key not in MODEL_INFO:
+            return jsonify({
+                "error": (
+                    f"The selected model variant {model_key!r} is not "
+                    "supported by this web app."
+                )
+            }), 422
+
+        result_info = load_result_info(model_key)
+        measured_latency = result_info.get("mean_latency_ms")
+        latency_target = settings["max_latency_ms"]
+        if latency_target is not None and not isinstance(
+            measured_latency, (int, float)
+        ):
+            return jsonify({
+                "error": (
+                    f"No benchmark latency is available for {model_key}; "
+                    "cannot enforce the requested latency target."
+                )
+            }), 422
+        if latency_target is not None and measured_latency > latency_target:
+            return jsonify({
+                "error": (
+                    f"No selected model meets the {latency_target:g} ms latency "
+                    f"target; {model_key} is benchmarked at "
+                    f"{measured_latency:g} ms."
+                )
+            }), 422
+
+        try:
+            stats = get_system_stats()
+            video_session.record_resources(
+                stats["cpu_percent"],
+                stats["process_rss_mb"],
+            )
+            model = load_model(model_key)
+            processor = load_processor()
+            profile = selector_result.get("profile", {}) if selector_result else {}
+            resolution = profile.get(
+                "input_resolution",
+                MODEL_INFO[model_key]["resolution"],
+            )
+            prepared_image = prepare_image(video_session.best_frame, int(resolution))
+            energy_start = read_cpu_energy_joules()
+            inference_started = time.perf_counter()
+            answer = generate_answer(
+                model,
+                processor,
+                prepared_image,
+                settings["task"],
+                settings["question"],
+                detailed=video_session.best_frame_detailed,
+            )
+            latency_ms = (time.perf_counter() - inference_started) * 1000
+            energy_joules = energy_delta_joules(
+                energy_start,
+                read_cpu_energy_joules(),
+            )
+            stats = get_system_stats()
+            video_session.record_resources(
+                stats["cpu_percent"],
+                stats["process_rss_mb"],
+            )
+            video_session.record_inference(
+                video_session.best_frame,
+                time.monotonic(),
+                latency_ms,
+                model_key,
+                answer,
+                energy_joules,
+                video_session.best_frame_timestamp_seconds,
+                detailed=video_session.best_frame_detailed,
+                evidence_data_url=encode_video_evidence(
+                    video_session.best_frame
+                ),
+                audio_visual_verified=(
+                    video_session.best_frame_audio_verified
+                ),
+                reason="single_result_best_frame",
+            )
+        except Exception as error:
+            app.logger.exception("Single-result video inference failed")
+            return jsonify({"error": str(error)}), 500
+
+    metrics = video_session.summary()
+    if video_session.model_counts:
+        model_key = max(
+            video_session.model_counts,
+            key=video_session.model_counts.get,
+        )
+        result_info = load_result_info(model_key)
+        metrics.update({
+            "selected_model": model_key,
+            "selected_model_display": MODEL_INFO[model_key]["display_name"],
+            "model_size_mb": result_info.get("size_mb"),
+            "model_footprint_mb": (
+                result_info.get("isolated_footprint_mb")
+                or result_info.get("model_footprint_mb")
+            ),
+        })
+    return jsonify({"success": True, "metrics": metrics})
 
 
 # ============================================================

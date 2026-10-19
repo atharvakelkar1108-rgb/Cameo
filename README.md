@@ -68,7 +68,83 @@ python webapp/app.py
 Open <http://localhost:5000>. The first request can be slow because the
 processor and model are loaded and cached. The app supports baseline,
 quantized, pruned, and combined optimized variants when their local artifacts
-are available.
+are available. In the AI Workspace, uploaded videos are decoded in the
+browser and sampled at 2 frames per second; a lightweight image-difference
+gate detects scene changes. Uploaded videos make one VLM call for a single
+concise caption of the sampled frame with the strongest detected scene change;
+subsequent sampled frames are event-checked without repeated VLM calls. Live
+camera inference uses the same event gate and can continue producing captions.
+Both modes can use adaptive model selection and an optional measured-latency
+target. Live inference keeps a bounded buffer of skipped frames and replays a
+high-value candidate when a later event triggers inference. Captions link to
+their timestamps and keyframe thumbnails.
+
+The event gate also estimates normalized visual-change value and treats
+near-threshold frames as uncertain, requesting a more detailed caption.
+Caption-word overlap feedback adjusts the event threshold within bounded
+limits during a live session. An optional CPU-package energy budget in J/min
+adjusts the event threshold when a reliable Intel RAPL reading is available;
+important and uncertain events bypass energy-based deferral. Without a
+supported energy meter the controller remains inactive and says so. Energy
+debt sums observed VLM-generation package energy over a rolling 60-second
+window; it excludes idle and browser-decoding energy. Auto model selection
+applies a configurable BLEU-4 retention floor against the FP32 benchmark for
+that model family. Uncertain, query-relevant, and audio-confirmed events
+request a stricter accuracy-first choice within that quality floor.
+
+Video queries use temporal/action terms and simple requested-color cues to
+adjust frame relevance. This is a lightweight heuristic, not a text-image
+embedding model. Uploaded-video audio is sampled in the browser only for files
+up to 24 MB and 120 seconds; live inference optionally requests microphone
+access. Audio RMS corroborates activity around a visual change but does not
+recognize speech or audio-event semantics. If audio is unavailable, video
+processing continues as visual-only and reports that source.
+
+The completed video session reports sampled frames, VLM call reduction,
+inference and frame-processing latency, CPU/RAM use, and a conventional
+frame-by-frame comparison at the same 2 fps sampling cadence. CPU-package energy during VLM generation is reported only when a readable
+Intel RAPL counter is available; frame decoding and event-gate energy are not
+included. Otherwise the UI explicitly marks energy as unavailable. The
+conventional latency/energy values are estimates based on the session's
+measured per-inference average, not an additional frame-by-frame benchmark run.
+
+## Annotated video benchmark
+
+After generating model profiles (including BLEU-4), prepare a local JSON
+manifest with sampled frame paths, event timestamps, and reference captions.
+The benchmark runs the adaptive pipeline and a frame-by-frame VLM comparator
+over the same samples:
+
+```powershell
+python scripts/video_pipeline_benchmark.py .\\data\\video_eval_manifest.json `
+  --quality-retention 0.90 `
+  --output .\\results\\video_pipeline_benchmark.json
+```
+
+Example manifest (frame paths are relative to the manifest):
+
+```json
+{
+  "event_timestamp_tolerance_seconds": 0.5,
+  "videos": [{
+    "id": "clip-01",
+    "frames": [
+      {"image": "frames/clip-01-000.jpg", "timestamp_seconds": 0.0, "audio_rms": 0.01},
+      {"image": "frames/clip-01-001.jpg", "timestamp_seconds": 0.5, "audio_rms": 0.08}
+    ],
+    "event_timestamps_seconds": [0.5],
+    "reference_captions": ["A person opens a door."]
+  }]
+}
+```
+
+The report includes best-reference unigram token F1, annotated missed-event
+rate (an event is detected when an inference is within the configured
+timestamp tolerance), mean/p95 inference latency, CPU/RAM, inference frequency,
+and measured CPU-package energy when RAPL is available. Token F1 is a lexical
+overlap proxy, not a semantic or human quality judgment. Keep annotated media
+and reference captions local. The frame-by-frame comparison can be very slow
+because it deliberately invokes the VLM for every supplied frame.
 
 ## Metrics and findings
 

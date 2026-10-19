@@ -408,6 +408,7 @@ def select_model(
     cpu_cores: int,
     priority: str = "auto",
     max_latency_ms: float = None,
+    min_quality_retention: float = None,
 ) -> dict:
 
     profiles = load_model_profiles()
@@ -431,6 +432,50 @@ def select_model(
                 0,
         }
 
+    if min_quality_retention is not None:
+        if not 0.0 <= min_quality_retention <= 1.0:
+            return {
+                "selected": None,
+                "explanation": "Quality retention must be between 0 and 1.",
+                "profiles_available": len(profiles),
+            }
+
+        baseline_quality = {}
+        for profile in profiles.values():
+            if (
+                profile.get("bleu4") is not None
+                and profile["bleu4"] > 0
+                and profile.get("model_family")
+            ):
+                family = profile["model_family"]
+                if (
+                    profile.get("compression") == "FP32"
+                    or profile.get("deployment") == "PC / high-memory device"
+                ):
+                    baseline_quality[family] = profile["bleu4"]
+
+        quality_filtered = {
+            key: profile
+            for key, profile in profiles.items()
+            if (
+                profile.get("bleu4") is not None
+                and profile.get("model_family") in baseline_quality
+                and profile["bleu4"]
+                >= baseline_quality[profile["model_family"]]
+                * min_quality_retention
+            )
+        }
+        if not quality_filtered:
+            return {
+                "selected": None,
+                "explanation": (
+                    "No benchmarked model meets the requested BLEU-4 "
+                    "retention relative to its FP32 family baseline."
+                ),
+                "profiles_available": len(profiles),
+                "quality_retention_required": min_quality_retention,
+            }
+        profiles = quality_filtered
 
     # --------------------------------------------------------
     # RAM budget
@@ -467,6 +512,17 @@ def select_model(
     # --------------------------------------------------------
 
     if not fitting:
+
+        if min_quality_retention is not None:
+            return {
+                "selected": None,
+                "explanation": (
+                    "No model meeting the requested BLEU-4 retention fits "
+                    "within the available RAM safety budget."
+                ),
+                "profiles_available": len(profiles),
+                "quality_retention_required": min_quality_retention,
+            }
 
         valid_profiles = {
 
@@ -530,9 +586,17 @@ def select_model(
             )
         }
 
-        if latency_filtered:
-
-            fitting = latency_filtered
+        if not latency_filtered:
+            return {
+                "selected": None,
+                "explanation": (
+                    f"No RAM-compatible, quality-compliant model meets the "
+                    f"{max_latency_ms:g} ms latency limit."
+                ),
+                "profiles_available": len(profiles),
+                "quality_retention_required": min_quality_retention,
+            }
+        fitting = latency_filtered
 
 
     # --------------------------------------------------------
@@ -912,6 +976,29 @@ def select_model(
 
         "candidates":
             list(fitting.keys()),
+        "quality_retention_required": min_quality_retention,
+        "quality_retention_vs_baseline": (
+            round(
+                chosen["bleu4"]
+                / next(
+                    profile["bleu4"]
+                    for profile in load_model_profiles().values()
+                    if (
+                        profile.get("model_family")
+                        == chosen.get("model_family")
+                        and (
+                            profile.get("compression") == "FP32"
+                            or profile.get("deployment")
+                            == "PC / high-memory device"
+                        )
+                    )
+                ),
+                4,
+            )
+            if min_quality_retention is not None
+            and chosen.get("bleu4") is not None
+            else None
+        ),
     }
 
 
