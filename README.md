@@ -66,14 +66,16 @@ python webapp/app.py
 ```
 
 Open <http://localhost:5000>. On startup the app preloads the processor and
-all four local variants (baseline, INT8, pruned, and INT8+pruned) when their
-weights exist, then keeps them in RAM. Later image and video requests reuse
-that cache instead of calling `from_pretrained` / `torch.load` again. Adaptive
+all four local variants: INT8, pruned converted to INT8, INT8+pruned, and
+FP32 baseline. Compressed checkpoints are warmed first. If
+`quantized_model.pt` is missing, the app builds dynamic INT8 from the
+Hugging Face weights at startup. Later image and video requests reuse that
+cache instead of calling `from_pretrained` / `torch.load` again. Adaptive
 selection also prefers an already-loaded variant when it still fits the
 resource budget, so swapping models does not reload weights on every frame.
 Set `CAMEO_PRELOAD=0` to skip startup preload, or
-`CAMEO_PRELOAD_MODEL=quantized,pruned` to warm only a subset. The app supports
-baseline,
+`CAMEO_PRELOAD_MODEL=quantized,pruned` to warm only a subset. The app
+supports baseline,
 quantized, pruned, and combined optimized variants when their local artifacts
 are available. In the AI Workspace, uploaded videos are decoded in the
 browser and sampled at 2 frames per second; a lightweight image-difference
@@ -170,9 +172,12 @@ profiles.
 
 For live camera inference, allow camera access and wait until the preview shows
 “Camera ready” before starting. Camera access requires `localhost` or HTTPS.
-Microphone permission is optional; blocking it continues with visual-only
-inference. CPU-only VLM inference can take several seconds per caption, so the
-status may remain on a frame while inference completes.
+Microphone permission is optional; if the browser asks for both camera and
+microphone at once, blocking the microphone still continues with visual-only
+inference. CPU-only VLM inference can take several seconds per caption. The
+camera keeps sampling during that wait and queues later frames so a scene
+change is not dropped. The modal status reports skipped frames as well as
+VLM events.
 
 ## Metrics and findings
 

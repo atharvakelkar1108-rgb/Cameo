@@ -963,6 +963,26 @@
             margin: 13px 0;
         }
 
+        #cameraStatus {
+            max-width: none;
+            margin-top: 10px;
+            text-align: center;
+        }
+
+        .camera-live-output {
+            margin-top: 10px;
+            padding: 10px 12px;
+            border-radius: 10px;
+            border: 1px solid var(--border);
+            background: rgba(255,255,255,0.03);
+            color: var(--text);
+            font-size: 13px;
+            line-height: 1.45;
+            max-height: 140px;
+            overflow: auto;
+            white-space: pre-wrap;
+        }
+
         /* =========================
            LOADING
         ========================= */
@@ -2354,6 +2374,11 @@
 
         </div>
         <div class="upload-help" id="cameraStatus" aria-live="polite"></div>
+        <div
+            class="camera-live-output"
+            id="cameraLiveOutput"
+            hidden
+        ></div>
 
         <canvas
             id="cameraCanvas"
@@ -2553,6 +2578,9 @@
     const cameraCanvas =
         document.getElementById("cameraCanvas");
 
+    const cameraLiveOutput =
+        document.getElementById("cameraLiveOutput");
+
     function waitForCameraReady(timeoutMs = 10000) {
         if (cameraVideo.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA &&
             cameraVideo.videoWidth > 0 && cameraVideo.videoHeight > 0) {
@@ -2601,15 +2629,24 @@
 
             cameraBtn.disabled = true;
             cameraStatus.textContent = "Requesting camera access...";
-            cameraStream =
-                await navigator.mediaDevices.getUserMedia({
-                    audio: false,
-                    video: {
-                        facingMode: "user",
-                        width: {ideal: 640},
-                        height: {ideal: 480}
-                    }
-                });
+            const videoConstraints = {
+                facingMode: "user",
+                width: {ideal: 640},
+                height: {ideal: 480}
+            };
+            try {
+                cameraStream =
+                    await navigator.mediaDevices.getUserMedia({
+                        audio: true,
+                        video: videoConstraints
+                    });
+            } catch (mediaError) {
+                cameraStream =
+                    await navigator.mediaDevices.getUserMedia({
+                        audio: false,
+                        video: videoConstraints
+                    });
+            }
 
             cameraVideo.srcObject = cameraStream;
             cameraModal.classList.add("show");
@@ -2649,6 +2686,8 @@
         }
 
         cameraModal.classList.remove("show");
+        cameraLiveOutput.hidden = true;
+        cameraLiveOutput.textContent = "";
 
         if (cameraStream) {
 
@@ -2799,50 +2838,43 @@
         }
     }
 
-    async function createMicrophoneMeter() {
+    function createMicrophoneMeter(stream) {
         const AudioContextClass =
             window.AudioContext || window.webkitAudioContext;
-        if (!AudioContextClass || !navigator.mediaDevices?.getUserMedia) {
+        const audioTracks = stream?.getAudioTracks?.() || [];
+        if (!AudioContextClass || !audioTracks.length) {
             return {
                 available: false,
                 sample: () => null,
                 close: async () => {}
             };
         }
-        let stream;
-        let context;
-        try {
-            stream = await navigator.mediaDevices.getUserMedia({audio: true});
-            context = new AudioContextClass();
-            const source = context.createMediaStreamSource(stream);
-            const analyser = context.createAnalyser();
-            analyser.fftSize = 2048;
-            source.connect(analyser);
-            const samples = new Float32Array(analyser.fftSize);
-            return {
-                available: true,
-                sample: () => {
-                    analyser.getFloatTimeDomainData(samples);
-                    let sumSquares = 0;
-                    for (const sample of samples) {
-                        sumSquares += sample * sample;
-                    }
-                    return Math.sqrt(sumSquares / samples.length);
-                },
-                close: async () => {
-                    stream.getTracks().forEach(track => track.stop());
-                    await context.close();
+        const context = new AudioContextClass();
+        context.resume().catch(() => {});
+        const source = context.createMediaStreamSource(stream);
+        const analyser = context.createAnalyser();
+        analyser.fftSize = 2048;
+        source.connect(analyser);
+        const samples = new Float32Array(analyser.fftSize);
+        return {
+            available: true,
+            sample: () => {
+                if (context.state === "suspended") {
+                    context.resume().catch(() => {});
                 }
-            };
-        } catch (error) {
-            if (stream) stream.getTracks().forEach(track => track.stop());
-            if (context) await context.close();
-            return {
-                available: false,
-                sample: () => null,
-                close: async () => {}
-            };
-        }
+                analyser.getFloatTimeDomainData(samples);
+                let sumSquares = 0;
+                for (const sample of samples) {
+                    sumSquares += sample * sample;
+                }
+                return Math.sqrt(sumSquares / samples.length);
+            },
+            close: async () => {
+                source.disconnect();
+                analyser.disconnect();
+                await context.close();
+            }
+        };
     }
 
 
@@ -3127,6 +3159,44 @@
     }
 
 
+    function describeCameraGate(result) {
+        const eventValue = Number(result.event_value || 0).toFixed(2);
+        const motionValue = Number(result.motion_value || 0).toFixed(2);
+        const threshold = Number(result.effective_threshold || 0).toFixed(2);
+        const sampled = result.sampled_frames ?? "--";
+        if (result.should_infer) {
+            const detail = result.uncertain_event ? " (detailed analysis)" : "";
+            return `Event ${result.reason}${detail}. ` +
+                `VLM call ${result.vlm_invocations ?? 1}. ` +
+                `Change ${eventValue}, motion ${motionValue}, threshold ${threshold}.`;
+        }
+        if (result.reason === "energy_budget") {
+            return `Energy budget exceeded by ${result.energy_debt_j} J; ` +
+                `low-value event deferred. Change ${eventValue}.`;
+        }
+        return `No VLM call (${result.reason}). ` +
+            `Change ${eventValue}, motion ${motionValue}, threshold ${threshold}. ` +
+            `Sampled frame ${sampled}.`;
+    }
+
+
+    function showLiveCameraOutputs(outputs, result) {
+        cameraLiveOutput.hidden = false;
+        cameraLiveOutput.textContent = formatVideoOutputs(outputs);
+        displayPrediction({
+            output: formatVideoOutputs(outputs),
+            latency_ms: result.latency_ms,
+            model_display: result.model_display || "Event-driven live inference",
+            size_mb: result.size_mb || result.model_size_mb
+        });
+        renderVideoEvidence(outputs);
+        if (result.model_display) {
+            document.getElementById("resultModelBadge").textContent =
+                result.model_display;
+        }
+    }
+
+
     async function runLiveCameraInference() {
         if (!cameraStream) {
             cameraStatus.textContent =
@@ -3138,19 +3208,22 @@
         let audioMeter = null;
         const outputs = [];
         const canvas = document.createElement("canvas");
+        const pendingSamples = [];
         cameraInferenceActive = true;
         cameraLiveBtn.textContent = "Stop Live Inference";
         captureBtn.disabled = true;
+        cameraLiveOutput.hidden = true;
+        cameraLiveOutput.textContent = "";
         cameraStatus.textContent =
             "Sampling camera frames; VLM runs only for scene changes or heartbeat frames.";
         cameraLoopPromise = (async () => {
+            let sampleTimer = null;
+            let processing = false;
             try {
                 cameraStatus.textContent =
                     "Waiting for camera frames before starting inference...";
                 await waitForCameraReady();
-                cameraStatus.textContent =
-                    "Requesting optional microphone access; choose Block to continue visual-only.";
-                audioMeter = await createMicrophoneMeter();
+                audioMeter = createMicrophoneMeter(cameraStream);
                 cameraStatus.textContent = audioMeter.available
                     ? "Sampling camera and microphone; VLM runs on verified events or heartbeat frames."
                     : "Microphone unavailable; continuing with visual-only event detection.";
@@ -3162,29 +3235,102 @@
                 });
                 sessionId = session.session_id;
                 const streamStartedAt = performance.now();
-                while (cameraInferenceActive && cameraStream) {
-                    await waitForCameraReady();
-                    cameraStatus.textContent =
-                        "Checking camera frame for a relevant event...";
-                    const result = await submitVideoFrame(
-                        sessionId,
-                        await frameBlob(cameraVideo, canvas),
-                        (performance.now() - streamStartedAt) / 1000,
-                        audioMeter.sample()
-                    );
+                const sampleInterval = session.sample_interval_ms || 500;
+                let capturing = false;
+
+                async function captureSample() {
+                    if (cameraVideo.videoWidth <= 0) {
+                        await waitForCameraReady(2000);
+                    }
+                    if (!cameraVideo.videoWidth) {
+                        throw new Error(
+                            "Camera preview stopped producing frames."
+                        );
+                    }
+                    return {
+                        blob: await frameBlob(cameraVideo, canvas),
+                        timestamp:
+                            (performance.now() - streamStartedAt) / 1000,
+                        audio: audioMeter.sample()
+                    };
+                }
+
+                async function handleResult(result) {
                     if (result.should_infer) {
                         outputs.push(...(result.recovered_outputs || []));
                         outputs.push(result);
-                        cameraStatus.textContent =
-                            `VLM invoked ${result.vlm_invocations} time(s); latest event: ${result.reason}${result.uncertain_event ? " (detailed analysis)" : ""}.`;
-                    } else if (result.reason === "energy_budget") {
-                        cameraStatus.textContent =
-                            `Energy budget is exceeded by ${result.energy_debt_j} J; low-value event deferred.`;
+                        showLiveCameraOutputs(outputs, result);
                     }
-                    await new Promise(resolve =>
-                        setTimeout(resolve, session.sample_interval_ms)
-                    );
+                    cameraStatus.textContent = describeCameraGate(result);
                 }
+
+                async function processSample(sample) {
+                    const result = await submitVideoFrame(
+                        sessionId,
+                        sample.blob,
+                        sample.timestamp,
+                        sample.audio
+                    );
+                    await handleResult(result);
+                }
+
+                async function drainSamples() {
+                    if (processing) return;
+                    processing = true;
+                    try {
+                        while (pendingSamples.length && cameraInferenceActive) {
+                            await processSample(pendingSamples.shift());
+                        }
+                    } finally {
+                        processing = false;
+                        if (pendingSamples.length && cameraInferenceActive) {
+                            await drainSamples();
+                        }
+                    }
+                }
+
+                async function onSampleTick() {
+                    if (!cameraInferenceActive || !cameraStream || capturing) {
+                        return;
+                    }
+                    capturing = true;
+                    try {
+                        pendingSamples.push(await captureSample());
+                        if (pendingSamples.length > 24) {
+                            pendingSamples.shift();
+                        }
+                        if (processing) {
+                            cameraStatus.textContent =
+                                `VLM is busy; queued ${pendingSamples.length} ` +
+                                "later camera frame(s) so a scene change is not dropped.";
+                            return;
+                        }
+                        await drainSamples();
+                    } catch (error) {
+                        cameraStatus.textContent = error.message;
+                    } finally {
+                        capturing = false;
+                    }
+                }
+
+                await onSampleTick();
+                sampleTimer = setInterval(() => {
+                    onSampleTick().catch(error => {
+                        cameraStatus.textContent = error.message;
+                    });
+                }, sampleInterval);
+
+                while (cameraInferenceActive && cameraStream) {
+                    await new Promise(resolve => setTimeout(resolve, 150));
+                }
+                if (sampleTimer) {
+                    clearInterval(sampleTimer);
+                    sampleTimer = null;
+                }
+                while (processing) {
+                    await new Promise(resolve => setTimeout(resolve, 50));
+                }
+
                 const metrics = await finishVideoSession(sessionId);
                 sessionFinished = true;
                 displayVideoSummary(outputs, metrics);
@@ -3194,6 +3340,7 @@
                 errorBox.innerHTML =
                     `<div class="error">${escapeHtml(error.message)}</div>`;
             } finally {
+                if (sampleTimer) clearInterval(sampleTimer);
                 if (audioMeter) await audioMeter.close();
                 cameraInferenceActive = false;
                 cameraLiveBtn.textContent = "Start Live Inference";

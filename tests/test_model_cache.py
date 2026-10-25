@@ -9,6 +9,12 @@ class FakeModel:
     def generate(self, **kwargs):
         return kwargs.get("input_ids")
 
+    def to(self, device):
+        return self
+
+    def eval(self):
+        return self
+
 
 class FakeProcessor:
     def __call__(self, **kwargs):
@@ -91,7 +97,7 @@ class ModelCacheTests(unittest.TestCase):
     def test_warmup_skips_objects_without_generate(self):
         web.warmup_inference(object(), object())
 
-    def test_preload_warms_all_four_variants_by_default(self):
+    def test_preload_warms_int8_variants_and_baseline_by_default(self):
         with patch.dict(os.environ, {"CAMEO_PRELOAD_MODEL": ""}, clear=False), \
              patch.object(web, "load_processor") as load_processor, \
              patch.object(web, "acquire_model") as acquire:
@@ -100,8 +106,44 @@ class ModelCacheTests(unittest.TestCase):
         load_processor.assert_called_once()
         self.assertEqual(
             [call.args[0] for call in acquire.call_args_list],
-            ["baseline", "quantized", "pruned", "optimized"],
+            ["quantized", "pruned", "optimized", "baseline"],
         )
+
+    def test_pruned_model_is_converted_to_int8_on_first_load(self):
+        fp32 = FakeModel()
+        int8 = FakeModel()
+        weights = web.RESULTS_DIR / "pruned_model.pt"
+        with patch.object(type(weights), "exists", return_value=True), \
+             patch.object(web.torch, "load", return_value=fp32), \
+             patch.object(web, "apply_dynamic_int8", return_value=int8) as quant:
+            loaded = web.load_saved_model("pruned")
+
+        quant.assert_called_once_with(fp32)
+        self.assertIs(loaded, int8)
+        self.assertIs(web.MODEL_CACHE["pruned"], int8)
+
+    def test_quantized_is_built_from_pretrained_when_weights_missing(self):
+        fp32 = FakeModel()
+        int8 = FakeModel()
+        weights = web.RESULTS_DIR / "quantized_model.pt"
+        with patch.object(type(weights), "exists", return_value=False), \
+             patch.object(web, "load_pretrained_fp32_model", return_value=fp32), \
+             patch.object(web, "apply_dynamic_int8", return_value=int8) as quant:
+            loaded = web.load_saved_model("quantized")
+
+        quant.assert_called_once_with(fp32)
+        self.assertIs(loaded, int8)
+        self.assertIs(web.MODEL_CACHE["quantized"], int8)
+
+    def test_already_int8_model_is_not_requantized(self):
+        already = FakeModel()
+        already.modules = lambda: [already]
+        with patch.object(web, "is_dynamic_int8_model", return_value=True), \
+             patch.object(web.torch.quantization, "quantize_dynamic") as quant:
+            loaded = web.apply_dynamic_int8(already)
+
+        quant.assert_not_called()
+        self.assertIs(loaded, already)
 
     def test_preload_continues_when_one_variant_is_missing(self):
         def acquire(key):
@@ -116,7 +158,7 @@ class ModelCacheTests(unittest.TestCase):
 
         self.assertEqual(
             [call.args[0] for call in loader.call_args_list],
-            ["baseline", "quantized", "pruned", "optimized"],
+            ["quantized", "pruned", "optimized", "baseline"],
         )
 
 

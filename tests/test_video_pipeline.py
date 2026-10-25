@@ -185,6 +185,33 @@ class VideoSessionTests(unittest.TestCase):
         self.assertEqual(recovered["reason"], "missed_event_recovery")
         self.assertEqual(recovered["timestamp_seconds"], 0.5)
 
+    def test_frame_to_frame_motion_triggers_when_scene_returns(self):
+        session = VideoSession()
+        still = Image.new("RGB", (32, 32), "black")
+        moved = Image.new("RGB", (32, 32), "white")
+        session.record_inference(
+            still, 10.0, 100.0, "quantized", "A still scene.", None, 0.0
+        )
+
+        skipped_during_cooldown = session.analyze_frame(moved, now=10.2)
+        self.assertFalse(skipped_during_cooldown["should_infer"])
+        self.assertEqual(skipped_during_cooldown["reason"], "cooldown")
+
+        returned = session.analyze_frame(still, now=10.6)
+        self.assertTrue(returned["should_infer"])
+        self.assertEqual(returned["reason"], "scene_change")
+        self.assertGreater(returned["motion_value"], returned["event_value"])
+
+    def test_analyze_frame_without_prior_inference_timestamp(self):
+        session = VideoSession()
+        session.reference_frame = Image.new("L", (64, 64), 0)
+        decision = session.analyze_frame(
+            Image.new("RGB", (32, 32), "white"),
+            now=10.0,
+        )
+        self.assertTrue(decision["should_infer"])
+        self.assertEqual(decision["reason"], "scene_change")
+
     def test_audio_confirms_a_low_magnitude_visual_event(self):
         session = VideoSession()
         dark = Image.new("RGB", (32, 32), "black")

@@ -57,6 +57,7 @@ class VideoSession:
     started_at: float = field(default_factory=monotonic)
     last_inference_at: Optional[float] = None
     reference_frame: Optional[Image.Image] = None
+    last_sampled_frame: Optional[Image.Image] = None
     best_frame: Optional[Image.Image] = None
     best_frame_timestamp_seconds: Optional[float] = None
     best_frame_score: float = -1.0
@@ -93,6 +94,25 @@ class VideoSession:
     @staticmethod
     def _small_grayscale(image: Image.Image) -> Image.Image:
         return image.convert("L").resize((64, 64), Image.Resampling.BILINEAR)
+
+    def _change_metrics(
+        self,
+        current: Image.Image,
+        previous: Image.Image,
+    ) -> tuple[float, float, float]:
+        difference = ImageChops.difference(current, previous)
+        mean_difference = ImageStat.Stat(difference).mean[0] / 255
+        changed_pixels = sum(
+            count
+            for value, count in enumerate(difference.histogram())
+            if value >= 32
+        )
+        changed_fraction = changed_pixels / (64 * 64)
+        event_value = max(
+            mean_difference / FRAME_CHANGE_THRESHOLD,
+            changed_fraction / FRAME_CHANGED_PIXEL_THRESHOLD,
+        )
+        return mean_difference, changed_fraction, event_value
 
     def _query_relevance(
         self,
@@ -244,9 +264,11 @@ class VideoSession:
         if audio_rms is not None:
             self.audio_sample_count += 1
 
+        current = self._small_grayscale(image)
         if self.reference_frame is None:
+            self.last_sampled_frame = current
             if self.settings.get("single_result"):
-                self.reference_frame = self._small_grayscale(image)
+                self.reference_frame = current
                 self.best_frame = image.copy()
                 self.best_frame_timestamp_seconds = timestamp_seconds
                 self.best_frame_score = 0.0
@@ -262,6 +284,7 @@ class VideoSession:
                     "energy_debt_j": 0.0,
                     "effective_threshold": self.learned_event_threshold,
                 }
+            self.reference_frame = current
             decision = {
                 "should_infer": True,
                 "reason": "initial_frame",
@@ -276,20 +299,17 @@ class VideoSession:
             self.gate_decisions.append(decision)
             return decision
 
-        current = self._small_grayscale(image)
         previous = self._small_grayscale(self.reference_frame)
-        difference = ImageChops.difference(current, previous)
-        mean_difference = ImageStat.Stat(difference).mean[0] / 255
-        changed_pixels = sum(
-            count
-            for value, count in enumerate(difference.histogram())
-            if value >= 32
+        mean_difference, changed_fraction, event_value = self._change_metrics(
+            current, previous
         )
-        changed_fraction = changed_pixels / (64 * 64)
-        event_value = max(
-            mean_difference / FRAME_CHANGE_THRESHOLD,
-            changed_fraction / FRAME_CHANGED_PIXEL_THRESHOLD,
-        )
+        motion_value = event_value
+        if self.last_sampled_frame is not None:
+            _, _, motion_value = self._change_metrics(
+                current, self._small_grayscale(self.last_sampled_frame)
+            )
+        self.last_sampled_frame = current
+        gate_score = max(event_value, motion_value)
         query_relevance = self._query_relevance(
             image, event_value, changed_fraction
         )
@@ -312,7 +332,7 @@ class VideoSession:
         if audio_confirmed:
             effective_threshold *= 0.8
         audio_visual_verified = (
-            audio_confirmed and event_value >= effective_threshold * 0.5
+            audio_confirmed and gate_score >= effective_threshold * 0.5
         )
         if self.settings.get("single_result"):
             score = event_value * (1 + query_relevance * 0.3)
@@ -342,6 +362,7 @@ class VideoSession:
                 "mean_difference": mean_difference,
                 "changed_fraction": changed_fraction,
                 "event_value": event_value,
+                "motion_value": motion_value,
                 "query_relevance": query_relevance,
                 "audio_rms": audio_rms,
                 "audio_visual_verified": audio_visual_verified,
@@ -357,14 +378,21 @@ class VideoSession:
                 self.query_relevant_count += 1
             return decision
 
-        elapsed = now - self.last_inference_at
+        elapsed = (
+            MIN_INFERENCE_INTERVAL_SECONDS
+            if self.last_inference_at is None
+            else now - self.last_inference_at
+        )
         uncertainty_margin = 0.25
         lower_bound = effective_threshold * (1 - uncertainty_margin)
         upper_bound = effective_threshold * (1 + uncertainty_margin)
-        uncertain = lower_bound <= event_value <= upper_bound
-        important_event = event_value >= max(2.0, effective_threshold * 2)
+        uncertain = lower_bound <= gate_score <= upper_bound
+        important_event = gate_score >= max(2.0, effective_threshold * 2)
         important_event = important_event or audio_visual_verified
-        heartbeat = elapsed >= MAX_INFERENCE_INTERVAL_SECONDS
+        heartbeat = (
+            self.last_inference_at is not None
+            and elapsed >= MAX_INFERENCE_INTERVAL_SECONDS
+        )
         estimated_latency_ms = (
             mean(self.inference_latencies_ms)
             if self.inference_latencies_ms
@@ -390,11 +418,11 @@ class VideoSession:
         elif audio_visual_verified:
             reason = "audio_visual_event"
             should_infer = True
-        elif event_value < lower_bound:
+        elif gate_score < lower_bound:
             reason = (
                 "energy_budget"
                 if energy_pressure
-                and event_value >= self.learned_event_threshold * (
+                and gate_score >= self.learned_event_threshold * (
                     1 - uncertainty_margin
                 )
                 else "redundant"
@@ -424,6 +452,7 @@ class VideoSession:
             "mean_difference": mean_difference,
             "changed_fraction": changed_fraction,
             "event_value": event_value,
+            "motion_value": motion_value,
             "query_relevance": query_relevance,
             "audio_rms": audio_rms,
             "audio_confirmed": audio_confirmed,

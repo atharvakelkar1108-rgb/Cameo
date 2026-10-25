@@ -79,6 +79,16 @@ MODEL_NAME = (
 
 DEVICE = "cpu"
 
+# Warm INT8 variants first, then FP32 baseline, so compressed
+# models are ready even if the full-precision load is slow or
+# runs out of RAM.
+DEFAULT_PRELOAD_MODELS = (
+    "quantized",
+    "pruned",
+    "optimized",
+    "baseline",
+)
+
 
 # ============================================================
 # CPU CONFIGURATION
@@ -103,6 +113,9 @@ except RuntimeError:
 # SmolVLM from Hugging Face or a pickled .pt file is typically
 # several seconds and dominates the first request. Later requests
 # reuse MODEL_CACHE so measured latency is inference only.
+# Default preload warms the three compressed variants as dynamic
+# INT8, then FP32 baseline, so later requests can switch models
+# without another from_pretrained / torch.load.
 
 MODEL_CACHE = {}
 
@@ -226,6 +239,57 @@ def load_processor():
         return processor
 
 
+def is_dynamic_int8_model(model):
+
+    for module in model.modules():
+        module_type = (
+            type(module).__module__
+            + "."
+            + type(module).__name__
+        ).lower()
+        if "quantized" in module_type:
+            return True
+    return False
+
+
+def apply_dynamic_int8(model):
+
+    if model is None or is_dynamic_int8_model(model):
+        return model
+
+    print(
+        "Applying dynamic INT8 quantization for faster CPU inference..."
+    )
+    return torch.quantization.quantize_dynamic(
+        model,
+        {torch.nn.Linear},
+        dtype=torch.qint8,
+    )
+
+
+def load_pretrained_fp32_model():
+
+    print()
+    print(
+        "Loading SmolVLM-256M from Hugging Face..."
+    )
+
+    from transformers import (
+        AutoModelForMultimodalLM
+    )
+
+    model = (
+        AutoModelForMultimodalLM.from_pretrained(
+            MODEL_NAME,
+            dtype=torch.float32,
+            _attn_implementation="eager"
+        )
+    )
+    model.to(DEVICE)
+    model.eval()
+    return model
+
+
 # ============================================================
 # LOAD BASELINE MODEL
 # ============================================================
@@ -240,47 +304,14 @@ def load_baseline_model():
                 "baseline"
             ]
 
-
-        print()
-
-        print(
-            "Loading baseline FP32 model..."
-        )
-
-
-        from transformers import (
-            AutoModelForMultimodalLM
-        )
-
-
-        model = (
-            AutoModelForMultimodalLM.from_pretrained(
-                MODEL_NAME,
-
-                dtype=torch.float32,
-
-                _attn_implementation="eager"
-            )
-        )
-
-
-        model.to(
-            DEVICE
-        )
-
-        model.eval()
-
-
+        model = load_pretrained_fp32_model()
         MODEL_CACHE[
             "baseline"
         ] = model
 
-
         print(
-            "Baseline model loaded."
+            "Baseline FP32 model loaded."
         )
-
-
         return model
 
 
@@ -328,6 +359,21 @@ def load_saved_model(
 
 
         if not weights_path.exists():
+            if model_key == "quantized":
+                print()
+                print(
+                    "quantized_model.pt not found; "
+                    "building dynamic INT8 from pretrained weights."
+                )
+                model = apply_dynamic_int8(
+                    load_pretrained_fp32_model()
+                )
+                MODEL_CACHE[model_key] = model
+                print(
+                    MODEL_INFO[model_key]["display_name"]
+                    + " loaded as INT8."
+                )
+                return model
 
             raise FileNotFoundError(
                 "Saved model not found: "
@@ -362,6 +408,7 @@ def load_saved_model(
         )
 
         model.eval()
+        model = apply_dynamic_int8(model)
 
 
         MODEL_CACHE[
@@ -373,7 +420,7 @@ def load_saved_model(
             MODEL_INFO[
                 model_key
             ]["display_name"]
-            + " loaded."
+            + " loaded as INT8."
         )
 
 
@@ -461,7 +508,7 @@ def models_to_preload():
             if key in MODEL_INFO
         ]
 
-    return list(MODEL_INFO.keys())
+    return list(DEFAULT_PRELOAD_MODELS)
 
 
 def preload_default_models():
@@ -472,7 +519,7 @@ def preload_default_models():
 
     print()
     print(
-        "Preloading processor and all available models into memory..."
+        "Preloading processor, INT8 models, and FP32 baseline into memory..."
     )
     try:
         load_processor()
@@ -2516,6 +2563,7 @@ def process_video_frame():
             "mean_difference": round(analysis["mean_difference"], 4),
             "changed_fraction": round(analysis["changed_fraction"], 4),
             "event_value": round(analysis.get("event_value", 0.0), 3),
+            "motion_value": round(analysis.get("motion_value", 0.0), 3),
             "expected_information_benefit": round(
                 analysis.get("expected_information_benefit", 0.0), 3
             ),
@@ -2586,6 +2634,10 @@ def process_video_frame():
             analysis.get("query_relevance", 0.0), 3
         ),
         "event_value": round(analysis.get("event_value", 0.0), 3),
+        "motion_value": round(analysis.get("motion_value", 0.0), 3),
+        "effective_threshold": round(
+            analysis.get("effective_threshold", 1.0), 3
+        ),
         "expected_information_benefit": round(
             analysis.get("expected_information_benefit", 0.0), 3
         ),

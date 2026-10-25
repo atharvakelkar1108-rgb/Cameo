@@ -409,6 +409,7 @@ def select_model(
     priority: str = "auto",
     max_latency_ms: float = None,
     min_quality_retention: float = None,
+    cached_models=None,
 ) -> dict:
 
     profiles = load_model_profiles()
