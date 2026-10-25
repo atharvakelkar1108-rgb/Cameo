@@ -188,34 +188,6 @@ size. Also, PyTorch INT8 or sparse inference may be slower on some CPUs when
 optimized kernels are unavailable. These are expected results to discuss;
 ONNX Runtime or hardware-specific runtimes may provide better edge latency.
 
-## Suggested GitHub publishing sequence
-
-Install Git for Windows first if `git --version` is not recognized. Then run:
-
-```powershell
-git --version
-git init
-git branch -M main
-git add .gitignore README.md requirements.txt requirements-pi.txt scripts utils webapp report results
-git status
-git commit -m "Initial CAMEO project"
-git remote add origin https://github.com/<YOUR_USERNAME>/cameo-compressed-ai-for-multimodal-edge-optimization.git
-git push -u origin main
-```
-
-Before `git commit`, inspect `git status` and confirm that no dataset,
-personal image, secret, virtual environment, or model weight is listed. If a
-large file was staged accidentally, remove it from the index without deleting
-your local copy:
-
-```powershell
-git restore --staged path\\to\\file
-```
-
-Create the empty GitHub repository with the slug above before running
-`git remote add`. Do not initialize it with another README, license, or
-`.gitignore`, because those files already exist locally.
-
 ## Project structure
 
 ```text
