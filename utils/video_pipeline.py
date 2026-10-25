@@ -88,6 +88,7 @@ class VideoSession:
     audio_confirmed_count: int = 0
     query_relevant_count: int = 0
     last_query_alignment: Optional[float] = None
+    pinned_model: Optional[str] = None
 
     @staticmethod
     def _small_grayscale(image: Image.Image) -> Image.Image:

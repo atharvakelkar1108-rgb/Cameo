@@ -514,14 +514,32 @@ def select_model(
     if not fitting:
 
         if min_quality_retention is not None:
+            required_models = ", ".join(
+                (
+                    f"{key}: {profile.get('footprint_mb', 'unknown')} MB "
+                    f"runtime RAM, BLEU-4 "
+                    f"{profile.get('bleu4', 'unknown')}"
+                )
+                for key, profile in profiles.items()
+            )
             return {
                 "selected": None,
                 "explanation": (
-                    "No model meeting the requested BLEU-4 retention fits "
-                    "within the available RAM safety budget."
+                    f"No model meeting the requested BLEU-4 retention "
+                    f"({min_quality_retention:.0%}) fits the current safe RAM "
+                    f"budget of {ram_budget_mb:.0f} MB "
+                    f"({ram_available_mb:.0f} MB available x "
+                    f"{RAM_SAFETY_MARGIN:.0%}). Quality-compliant profiles: "
+                    f"{required_models or 'none'}. Increase free RAM, choose "
+                    "a manual model only if it fits your machine, or lower "
+                    "the BLEU-4 retention control to permit a lower-quality "
+                    "variant; selection was not silently downgraded."
                 ),
                 "profiles_available": len(profiles),
                 "quality_retention_required": min_quality_retention,
+                "ram_available_mb": round(ram_available_mb, 1),
+                "ram_budget_mb": round(ram_budget_mb, 1),
+                "quality_compliant_profiles": list(profiles),
             }
 
         valid_profiles = {

@@ -65,8 +65,15 @@ Start the Flask app from the project root:
 python webapp/app.py
 ```
 
-Open <http://localhost:5000>. The first request can be slow because the
-processor and model are loaded and cached. The app supports baseline,
+Open <http://localhost:5000>. On startup the app preloads the processor and
+all four local variants (baseline, INT8, pruned, and INT8+pruned) when their
+weights exist, then keeps them in RAM. Later image and video requests reuse
+that cache instead of calling `from_pretrained` / `torch.load` again. Adaptive
+selection also prefers an already-loaded variant when it still fits the
+resource budget, so swapping models does not reload weights on every frame.
+Set `CAMEO_PRELOAD=0` to skip startup preload, or
+`CAMEO_PRELOAD_MODEL=quantized,pruned` to warm only a subset. The app supports
+baseline,
 quantized, pruned, and combined optimized variants when their local artifacts
 are available. In the AI Workspace, uploaded videos are decoded in the
 browser and sampled at 2 frames per second; a lightweight image-difference
@@ -145,6 +152,27 @@ and measured CPU-package energy when RAPL is available. Token F1 is a lexical
 overlap proxy, not a semantic or human quality judgment. Keep annotated media
 and reference captions local. The frame-by-frame comparison can be very slow
 because it deliberately invokes the VLM for every supplied frame.
+
+## Troubleshooting adaptive selection and camera
+
+The default 90% BLEU-4 retention control is a hard quality filter: it never
+silently switches to a model below that benchmark. The selector also reserves
+25% of currently available RAM for the operating system and application.
+With the checked-in benchmark values, baseline and INT8 are the only models
+currently above the 90% family-baseline BLEU-4 floor; their measured runtime
+footprints are about 1,277 MB and 1,846 MB. Therefore, the safe RAM budget
+must meet the footprint of at least one eligible model. Lowering the retention
+control may admit lower-BLEU variants, but it does not make a model fit in less
+RAM. Close memory-heavy applications, check that model artifacts and benchmark
+profiles exist, or lower the floor only if the resulting quality tradeoff is
+acceptable. The error now reports the current safe budget and eligible
+profiles.
+
+For live camera inference, allow camera access and wait until the preview shows
+“Camera ready” before starting. Camera access requires `localhost` or HTTPS.
+Microphone permission is optional; blocking it continues with visual-only
+inference. CPU-only VLM inference can take several seconds per caption, so the
+status may remain on a frame while inference completes.
 
 ## Metrics and findings
 

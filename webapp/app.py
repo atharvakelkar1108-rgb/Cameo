@@ -42,7 +42,11 @@ sys.path.insert(
 # PROJECT IMPORTS
 # ============================================================
 
-from utils.model_selector import load_model_profiles, select_model
+from utils.model_selector import (
+    load_model_profiles,
+    select_model,
+    valid_number,
+)
 from utils.video_pipeline import (
     FRAME_CHANGE_THRESHOLD,
     MAX_INFERENCE_INTERVAL_SECONDS,
@@ -94,10 +98,17 @@ except RuntimeError:
 # ============================================================
 # MODEL CACHE
 # ============================================================
+#
+# Weights stay in process memory after the first load. Reloading
+# SmolVLM from Hugging Face or a pickled .pt file is typically
+# several seconds and dominates the first request. Later requests
+# reuse MODEL_CACHE so measured latency is inference only.
 
 MODEL_CACHE = {}
 
 PROCESSOR_CACHE = {}
+
+CACHE_LOCK = threading.RLock()
 
 VIDEO_SESSIONS = {}
 VIDEO_SESSIONS_LOCK = threading.Lock()
@@ -180,37 +191,39 @@ MODEL_INFO = {
 
 def load_processor():
 
-    if "processor" in PROCESSOR_CACHE:
+    with CACHE_LOCK:
 
-        return PROCESSOR_CACHE["processor"]
+        if "processor" in PROCESSOR_CACHE:
 
-
-    print()
-
-    print(
-        "Loading processor..."
-    )
+            return PROCESSOR_CACHE["processor"]
 
 
-    from transformers import AutoProcessor
+        print()
+
+        print(
+            "Loading processor..."
+        )
 
 
-    processor = AutoProcessor.from_pretrained(
-        MODEL_NAME
-    )
+        from transformers import AutoProcessor
 
 
-    PROCESSOR_CACHE[
-        "processor"
-    ] = processor
+        processor = AutoProcessor.from_pretrained(
+            MODEL_NAME
+        )
 
 
-    print(
-        "Processor loaded."
-    )
+        PROCESSOR_CACHE[
+            "processor"
+        ] = processor
 
 
-    return processor
+        print(
+            "Processor loaded."
+        )
+
+
+        return processor
 
 
 # ============================================================
@@ -219,54 +232,56 @@ def load_processor():
 
 def load_baseline_model():
 
-    if "baseline" in MODEL_CACHE:
+    with CACHE_LOCK:
 
-        return MODEL_CACHE[
-            "baseline"
-        ]
+        if "baseline" in MODEL_CACHE:
 
-
-    print()
-
-    print(
-        "Loading baseline FP32 model..."
-    )
+            return MODEL_CACHE[
+                "baseline"
+            ]
 
 
-    from transformers import (
-        AutoModelForMultimodalLM
-    )
+        print()
 
-
-    model = (
-        AutoModelForMultimodalLM.from_pretrained(
-            MODEL_NAME,
-
-            dtype=torch.float32,
-
-            _attn_implementation="eager"
+        print(
+            "Loading baseline FP32 model..."
         )
-    )
 
 
-    model.to(
-        DEVICE
-    )
-
-    model.eval()
+        from transformers import (
+            AutoModelForMultimodalLM
+        )
 
 
-    MODEL_CACHE[
-        "baseline"
-    ] = model
+        model = (
+            AutoModelForMultimodalLM.from_pretrained(
+                MODEL_NAME,
+
+                dtype=torch.float32,
+
+                _attn_implementation="eager"
+            )
+        )
 
 
-    print(
-        "Baseline model loaded."
-    )
+        model.to(
+            DEVICE
+        )
+
+        model.eval()
 
 
-    return model
+        MODEL_CACHE[
+            "baseline"
+        ] = model
+
+
+        print(
+            "Baseline model loaded."
+        )
+
+
+        return model
 
 
 # ============================================================
@@ -277,90 +292,92 @@ def load_saved_model(
     model_key
 ):
 
-    if model_key in MODEL_CACHE:
+    with CACHE_LOCK:
 
-        return MODEL_CACHE[
-            model_key
-        ]
+        if model_key in MODEL_CACHE:
+
+            return MODEL_CACHE[
+                model_key
+            ]
 
 
-    if model_key not in MODEL_INFO:
+        if model_key not in MODEL_INFO:
 
-        raise ValueError(
-            f"Unknown model variant: "
-            f"{model_key}"
+            raise ValueError(
+                f"Unknown model variant: "
+                f"{model_key}"
+            )
+
+
+        weights_file = (
+            MODEL_INFO[
+                model_key
+            ]["weights_file"]
         )
 
 
-    weights_file = (
-        MODEL_INFO[
-            model_key
-        ]["weights_file"]
-    )
+        if weights_file is None:
+
+            return load_baseline_model()
 
 
-    if weights_file is None:
-
-        return load_baseline_model()
-
-
-    weights_path = (
-        RESULTS_DIR /
-        weights_file
-    )
-
-
-    if not weights_path.exists():
-
-        raise FileNotFoundError(
-            "Saved model not found: "
-            + str(weights_path)
+        weights_path = (
+            RESULTS_DIR /
+            weights_file
         )
 
 
-    print()
+        if not weights_path.exists():
 
-    print(
-        "Loading saved model: "
-        + weights_path.name
-    )
-
-
-    # --------------------------------------------------------
-    # These .pt files contain complete model objects
-    # --------------------------------------------------------
-
-    model = torch.load(
-
-        weights_path,
-
-        weights_only=False,
-
-        map_location=DEVICE
-    )
+            raise FileNotFoundError(
+                "Saved model not found: "
+                + str(weights_path)
+            )
 
 
-    model.to(
-        DEVICE
-    )
+        print()
 
-    model.eval()
-
-
-    MODEL_CACHE[
-        model_key
-    ] = model
+        print(
+            "Loading saved model: "
+            + weights_path.name
+        )
 
 
-    print(
-        MODEL_INFO[
+        # --------------------------------------------------------
+        # These .pt files contain complete model objects
+        # --------------------------------------------------------
+
+        model = torch.load(
+
+            weights_path,
+
+            weights_only=False,
+
+            map_location=DEVICE
+        )
+
+
+        model.to(
+            DEVICE
+        )
+
+        model.eval()
+
+
+        MODEL_CACHE[
             model_key
-        ]["display_name"]
-        + " loaded."
-    )
+        ] = model
 
 
-    return model
+        print(
+            MODEL_INFO[
+                model_key
+            ]["display_name"]
+            + " loaded."
+        )
+
+
+        return model
 
 
 # ============================================================
@@ -379,6 +396,124 @@ def load_model(
     return load_saved_model(
         model_key
     )
+
+
+def warmup_inference(model, processor):
+
+    if (
+        not hasattr(model, "generate")
+        or not hasattr(processor, "__call__")
+    ):
+        return
+
+    dummy = Image.new("RGB", (64, 64), (8, 8, 8))
+    try:
+        generate_answer(
+            model,
+            processor,
+            dummy,
+            task="caption",
+        )
+    except Exception as error:
+        print("Model warmup skipped:", error)
+
+
+def acquire_model(model_key):
+
+    started = time.perf_counter()
+    with CACHE_LOCK:
+        cache_hit = (
+            model_key in MODEL_CACHE
+            and "processor" in PROCESSOR_CACHE
+        )
+
+    model = load_model(model_key)
+    processor = load_processor()
+    if not cache_hit:
+        warmup_inference(model, processor)
+
+    return {
+        "model": model,
+        "processor": processor,
+        "cache_hit": cache_hit,
+        "load_ms": round(
+            (time.perf_counter() - started) * 1000,
+            3,
+        ),
+    }
+
+
+def models_to_preload():
+
+    requested = os.environ.get(
+        "CAMEO_PRELOAD_MODEL",
+        "",
+    ).strip()
+    if requested:
+        keys = [
+            key.strip().lower()
+            for key in requested.split(",")
+            if key.strip()
+        ]
+        return [
+            key
+            for key in keys
+            if key in MODEL_INFO
+        ]
+
+    return list(MODEL_INFO.keys())
+
+
+def preload_default_models():
+
+    keys = models_to_preload()
+    if not keys:
+        keys = list(MODEL_INFO.keys())
+
+    print()
+    print(
+        "Preloading processor and all available models into memory..."
+    )
+    try:
+        load_processor()
+    except Exception as error:
+        print("Startup processor preload failed:", error)
+        return
+
+    loaded = []
+    for key in keys:
+        try:
+            acquire_model(key)
+            loaded.append(key)
+            print(
+                "Cached: "
+                + MODEL_INFO[key]["display_name"]
+            )
+        except FileNotFoundError as error:
+            print(
+                "Skipped "
+                + key
+                + " (weights not found): "
+                + str(error)
+            )
+        except Exception as error:
+            print(
+                "Failed to preload "
+                + key
+                + ": "
+                + str(error)
+            )
+
+    print()
+    if loaded:
+        print(
+            "Ready. Cached models: "
+            + ", ".join(loaded)
+        )
+    else:
+        print(
+            "No models were preloaded."
+        )
 
 
 # ============================================================
@@ -613,6 +748,12 @@ def get_system_stats():
 
         "device":
             DEVICE,
+
+        "cached_models":
+            list(MODEL_CACHE.keys()),
+
+        "model_ready":
+            bool(MODEL_CACHE) and bool(PROCESSOR_CACHE),
     }
 
 
@@ -711,7 +852,7 @@ def perform_selection(
 
     measured_energy = energy_profiles or {}
     if (
-        priority in ("auto", "balanced", "accuracy")
+        priority in ("auto", "balanced")
         and len(measured_energy) >= 2
         and not (selection_priority == "fast" and max_latency_ms is None)
     ):
@@ -733,6 +874,40 @@ def perform_selection(
                 f"({measured_energy[energy_selected]:.4f} J/inference)."
             )
             selection["energy_aware"] = True
+
+    selected_key = selection.get("selected")
+    if (
+        selected_key
+        and selection.get("priority_used") != "accuracy"
+        and selected_key not in MODEL_CACHE
+    ):
+        cached_candidates = [
+            key
+            for key in selection.get("candidates", [])
+            if key in MODEL_CACHE and key in MODEL_INFO
+        ]
+        if cached_candidates:
+            profiles = load_model_profiles()
+            reused = min(
+                cached_candidates,
+                key=lambda key: (
+                    profiles[key]["latency_ms"]
+                    if key in profiles and valid_number(
+                        profiles[key].get("latency_ms")
+                    )
+                    else float("inf")
+                ),
+            )
+            if reused in profiles:
+                selection["selected"] = reused
+                selection["profile"] = profiles[reused]
+            else:
+                selection["selected"] = reused
+            selection["reused_cached_model"] = True
+            selection["explanation"] = (
+                str(selection.get("explanation") or "")
+                + " Reused the already-loaded model to avoid reload latency."
+            )
 
 
     print(
@@ -1715,17 +1890,14 @@ def predict():
 
 
         # ----------------------------------------------------
-        # LOAD MODEL
+        # LOAD MODEL (cached after the first request)
         # ----------------------------------------------------
 
-        model = load_model(
+        runtime = acquire_model(
             selected_key
         )
-
-
-        processor = (
-            load_processor()
-        )
+        model = runtime["model"]
+        processor = runtime["processor"]
 
 
         # ----------------------------------------------------
@@ -1966,6 +2138,12 @@ def predict():
                     3
                 ),
 
+            "model_load_ms":
+                runtime["load_ms"],
+
+            "cache_hit":
+                runtime["cache_hit"],
+
             "device":
                 DEVICE
         }
@@ -2034,7 +2212,28 @@ def infer_video_candidate(
 ):
     settings = video_session.settings
     selector_result = None
-    if settings["adaptive"]:
+    accuracy_override = (
+        analysis.get("uncertain", False)
+        or analysis.get("audio_visual_verified", False)
+        or analysis.get("query_relevance", 0.0) >= 0.75
+    )
+    if (
+        settings["adaptive"]
+        and video_session.pinned_model
+        and video_session.pinned_model in MODEL_INFO
+        and not accuracy_override
+    ):
+        selected_key = video_session.pinned_model
+        selector_result = {
+            "selected": selected_key,
+            "profile": {},
+            "explanation": (
+                "Pinned the already-loaded model for this video session "
+                "to avoid reload latency."
+            ),
+            "reused_cached_model": True,
+        }
+    elif settings["adaptive"]:
         uncertain_or_verified = (
             analysis.get("uncertain", False)
             or analysis.get("audio_visual_verified", False)
@@ -2092,8 +2291,9 @@ def infer_video_candidate(
     video_session.record_resources(
         stats["cpu_percent"], stats["process_rss_mb"]
     )
-    model = load_model(selected_key)
-    processor = load_processor()
+    runtime = acquire_model(selected_key)
+    model = runtime["model"]
+    processor = runtime["processor"]
     profile = selector_result.get("profile", {}) if selector_result else {}
     resolution = profile.get(
         "input_resolution", MODEL_INFO[selected_key]["resolution"]
@@ -2135,6 +2335,7 @@ def infer_video_candidate(
     )
     if recovered:
         video_session.recovered_frame_count += 1
+    video_session.pinned_model = selected_key
 
     return {
         "answer": answer,
@@ -2476,8 +2677,9 @@ def stop_video_session():
                 stats["cpu_percent"],
                 stats["process_rss_mb"],
             )
-            model = load_model(model_key)
-            processor = load_processor()
+            runtime = acquire_model(model_key)
+            model = runtime["model"]
+            processor = runtime["processor"]
             profile = selector_result.get("profile", {}) if selector_result else {}
             resolution = profile.get(
                 "input_resolution",
@@ -2578,7 +2780,10 @@ def health():
         "cached_models":
             list(
                 MODEL_CACHE.keys()
-            )
+            ),
+
+        "model_ready":
+            bool(MODEL_CACHE) and bool(PROCESSOR_CACHE),
     })
 
 
@@ -2592,9 +2797,9 @@ def health():
 )
 def clear_cache():
 
-    MODEL_CACHE.clear()
-
-    PROCESSOR_CACHE.clear()
+    with CACHE_LOCK:
+        MODEL_CACHE.clear()
+        PROCESSOR_CACHE.clear()
 
     gc.collect()
 
@@ -2662,6 +2867,8 @@ if __name__ == "__main__":
         "=" * 65
     )
 
+    if os.environ.get("CAMEO_PRELOAD", "1") != "0":
+        preload_default_models()
 
     app.run(
 

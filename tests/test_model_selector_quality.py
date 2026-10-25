@@ -74,6 +74,27 @@ class ModelQualityConstraintTests(unittest.TestCase):
         self.assertIsNone(selection["selected"])
         self.assertIn("No benchmarked model", selection["explanation"])
 
+    def test_ram_failure_explains_compliant_profiles_and_budget(self):
+        with patch(
+            "utils.model_selector.load_model_profiles",
+            return_value=self.profiles,
+        ):
+            selection = select_model(
+                ram_available_mb=500,
+                cpu_cores=4,
+                priority="balanced",
+                min_quality_retention=0.95,
+            )
+
+        self.assertIsNone(selection["selected"])
+        self.assertEqual(selection["ram_budget_mb"], 375)
+        self.assertEqual(
+            set(selection["quality_compliant_profiles"]),
+            {"baseline", "pruned"},
+        )
+        self.assertIn("safe RAM budget of 375 MB", selection["explanation"])
+        self.assertIn("baseline: 800 MB runtime RAM", selection["explanation"])
+
 
 if __name__ == "__main__":
     unittest.main()

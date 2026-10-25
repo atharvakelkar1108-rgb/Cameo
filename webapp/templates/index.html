@@ -1736,8 +1736,13 @@
                     <div class="result-stats">
 
                         <div class="result-stat">
-                            <span>Latency</span>
+                            <span>Inference latency</span>
                             <strong id="resultLatency">--</strong>
+                        </div>
+
+                        <div class="result-stat">
+                            <span>Model load</span>
+                            <strong id="resultCache">--</strong>
                         </div>
 
                         <div class="video-metrics" id="videoMetrics"></div>
@@ -2548,26 +2553,86 @@
     const cameraCanvas =
         document.getElementById("cameraCanvas");
 
+    function waitForCameraReady(timeoutMs = 10000) {
+        if (cameraVideo.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA &&
+            cameraVideo.videoWidth > 0 && cameraVideo.videoHeight > 0) {
+            return Promise.resolve();
+        }
+        return new Promise((resolve, reject) => {
+            let timer;
+            const cleanup = () => {
+                clearTimeout(timer);
+                cameraVideo.removeEventListener("loadeddata", checkReady);
+                cameraVideo.removeEventListener("canplay", checkReady);
+                cameraVideo.removeEventListener("resize", checkReady);
+                cameraVideo.removeEventListener("error", handleError);
+            };
+            const checkReady = () => {
+                if (cameraVideo.readyState >=
+                    HTMLMediaElement.HAVE_CURRENT_DATA &&
+                    cameraVideo.videoWidth > 0 &&
+                    cameraVideo.videoHeight > 0) {
+                    cleanup();
+                    resolve();
+                }
+            };
+            const handleError = () => {
+                cleanup();
+                reject(new Error("The browser could not start the camera video."));
+            };
+            cameraVideo.addEventListener("loadeddata", checkReady);
+            cameraVideo.addEventListener("canplay", checkReady);
+            cameraVideo.addEventListener("resize", checkReady);
+            cameraVideo.addEventListener("error", handleError);
+            timer = setTimeout(() => {
+                cleanup();
+                reject(new Error(
+                    "Camera is not producing video yet. Check browser permission, " +
+                    "close other apps using the camera, and try again."
+                ));
+            }, timeoutMs);
+            checkReady();
+        });
+    }
 
     cameraBtn.addEventListener("click", async () => {
 
         try {
 
+            cameraBtn.disabled = true;
+            cameraStatus.textContent = "Requesting camera access...";
             cameraStream =
                 await navigator.mediaDevices.getUserMedia({
-                    video: true
+                    audio: false,
+                    video: {
+                        facingMode: "user",
+                        width: {ideal: 640},
+                        height: {ideal: 480}
+                    }
                 });
 
             cameraVideo.srcObject = cameraStream;
-
             cameraModal.classList.add("show");
+            await cameraVideo.play();
+            cameraStatus.textContent = "Waiting for the first camera frame...";
+            await waitForCameraReady();
+            cameraStatus.textContent =
+                `Camera ready (${cameraVideo.videoWidth} × ${cameraVideo.videoHeight}).`;
 
         } catch (error) {
 
-            alert(
-                "Camera access was not available. Please check browser permissions."
-            );
+            cameraStatus.textContent = error.message;
+            errorBox.innerHTML =
+                `<div class="error">${escapeHtml(error.message)} ` +
+                "Camera access requires browser permission and HTTPS or localhost.</div>";
+            if (cameraStream) {
+                cameraStream.getTracks().forEach(track => track.stop());
+                cameraStream = null;
+            }
+            cameraVideo.srcObject = null;
 
+        } finally {
+            cameraBtn.disabled = false;
         }
 
     });
@@ -3063,6 +3128,11 @@
 
 
     async function runLiveCameraInference() {
+        if (!cameraStream) {
+            cameraStatus.textContent =
+                "Open the camera and wait until the preview says Camera ready.";
+            return;
+        }
         let sessionId = null;
         let sessionFinished = false;
         let audioMeter = null;
@@ -3075,6 +3145,11 @@
             "Sampling camera frames; VLM runs only for scene changes or heartbeat frames.";
         cameraLoopPromise = (async () => {
             try {
+                cameraStatus.textContent =
+                    "Waiting for camera frames before starting inference...";
+                await waitForCameraReady();
+                cameraStatus.textContent =
+                    "Requesting optional microphone access; choose Block to continue visual-only.";
                 audioMeter = await createMicrophoneMeter();
                 cameraStatus.textContent = audioMeter.available
                     ? "Sampling camera and microphone; VLM runs on verified events or heartbeat frames."
@@ -3087,7 +3162,10 @@
                 });
                 sessionId = session.session_id;
                 const streamStartedAt = performance.now();
-                while (cameraInferenceActive && cameraStream && cameraVideo.videoWidth) {
+                while (cameraInferenceActive && cameraStream) {
+                    await waitForCameraReady();
+                    cameraStatus.textContent =
+                        "Checking camera frame for a relevant event...";
                     const result = await submitVideoFrame(
                         sessionId,
                         await frameBlob(cameraVideo, canvas),
@@ -3247,7 +3325,8 @@
         runBtn.disabled = true;
 
         loading.classList.add("show");
-        loadingMessage.textContent = "Running multimodal inference...";
+        loadingMessage.textContent =
+            "Running inference. Weights stay in memory after the first load.";
 
 
         try {
@@ -3302,9 +3381,6 @@
 
         lastInferenceLatency =
             data.latency_ms ??
-            data.total_latency_ms ??
-            data.latency ??
-            data.latency_s ??
             data.inference_time;
 
         const resultCard =
@@ -3326,13 +3402,17 @@
 
 
         document.getElementById("resultLatency").textContent =
-            formatSeconds(
-                data.latency_ms ??
-                data.total_latency_ms ??
-                data.latency ??
-                data.latency_s ??
-                data.inference_time
-            );
+            formatDurationMs(data.latency_ms ?? data.inference_time);
+
+        const cacheLabel = document.getElementById("resultCache");
+        if (data.cache_hit) {
+            cacheLabel.textContent = "reused from RAM";
+        } else if (data.model_load_ms != null) {
+            cacheLabel.textContent =
+                formatDurationMs(data.model_load_ms) + " (first load)";
+        } else {
+            cacheLabel.textContent = "--";
+        }
 
 
         document.getElementById("resultSize").textContent =
@@ -3634,7 +3714,7 @@
 
                 <div class="decision-item">
                     <span>Mean Latency</span>
-                    <strong>${formatSeconds(latency)}</strong>
+                    <strong>${formatDurationMs(latency)}</strong>
                 </div>
 
                 <div class="decision-item">
@@ -3756,14 +3836,14 @@
                             </td>
 
                             <td>
-                                ${formatSeconds(
+                                ${formatDurationMs(
                                     row.mean_latency_ms ??
                                     row.latency_ms
                                 )}
                             </td>
 
                             <td>
-                                ${formatSeconds(
+                                ${formatDurationMs(
                                     row.p95_latency_ms
                                 )}
                             </td>
@@ -3908,7 +3988,7 @@
             document.getElementById(
                 "dashLatency"
             ).textContent =
-                formatSeconds(lastLatency);
+                formatDurationMs(lastLatency);
 
 
             /* Monitoring */
@@ -3984,7 +4064,7 @@
             document.getElementById(
                 "monitorLatency"
             ).textContent =
-                formatSeconds(lastLatency);
+                formatDurationMs(lastLatency);
 
 
         } catch (error) {
@@ -4069,6 +4149,25 @@
         }
 
         return seconds.toFixed(2) + " s";
+
+    }
+
+    function formatDurationMs(value) {
+
+        if (
+            value === null ||
+            value === undefined ||
+            value === "" ||
+            Number.isNaN(Number(value))
+        ) {
+            return "--";
+        }
+
+        const ms = Number(value);
+        if (ms >= 1000) {
+            return (ms / 1000).toFixed(2) + " s";
+        }
+        return Math.round(ms) + " ms";
 
     }
 
